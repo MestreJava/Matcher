@@ -9,6 +9,7 @@ import traceback
 import unicodedata
 from collections import defaultdict, deque
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Callable
 
@@ -21,6 +22,14 @@ from tkinter import filedialog, messagebox, ttk
 
 
 ProgressCallback = Callable[[str, float | None], None]
+DEFAULT_SCORE_WEIGHTS = {
+    "weight_token_set": 27.0,
+    "weight_partial": 21.0,
+    "weight_sort": 15.0,
+    "weight_prefix": 15.0,
+    "weight_ordered_chars": 14.0,
+    "weight_aligned_chars": 8.0,
+}
 
 
 # =========================
@@ -110,26 +119,70 @@ def flags_to_text(flags: list[str]) -> str:
     return "; ".join(sorted(set(flag for flag in flags if flag)))
 
 
-def score_candidate(full_name: str, external_name: str, max_external_chars: int) -> dict[str, Any]:
+def resolve_score_weights(config: dict[str, Any] | None = None) -> dict[str, float]:
+    if config is None:
+        return dict(DEFAULT_SCORE_WEIGHTS)
+
+    weights = {}
+    for key, default_value in DEFAULT_SCORE_WEIGHTS.items():
+        raw_value = config.get(key, default_value)
+        try:
+            weights[key] = float(raw_value)
+        except Exception:
+            weights[key] = float(default_value)
+
+    positive_total = sum(max(0.0, value) for value in weights.values())
+    if positive_total <= 0:
+        return dict(DEFAULT_SCORE_WEIGHTS)
+    return {key: max(0.0, value) / positive_total for key, value in weights.items()}
+
+
+def aligned_character_ratio(left: str, right: str) -> float:
+    max_len = max(len(left), len(right))
+    if max_len == 0:
+        return 100.0
+    same_position = sum(1 for a, b in zip(left, right) if a == b)
+    return round((same_position / max_len) * 100, 2)
+
+
+def ordered_character_ratio(left: str, right: str) -> float:
+    if not left and not right:
+        return 100.0
+    return round(SequenceMatcher(None, left, right).ratio() * 100, 2)
+
+
+def score_candidate(
+    full_name: str,
+    external_name: str,
+    max_external_chars: int,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     full_tokens = token_set(full_name)
     ext_tokens = token_set(external_name)
+    weights = resolve_score_weights(config)
 
     same_first = first_token(full_name) == first_token(external_name) and first_token(full_name) != ""
     same_last = last_token(full_name) == last_token(external_name) and last_token(full_name) != ""
     ext_subset_in_full = bool(ext_tokens) and ext_tokens.issubset(full_tokens)
     full_subset_in_ext = bool(full_tokens) and full_tokens.issubset(ext_tokens)
     starts_like = full_name.startswith(external_name) or external_name.startswith(full_name)
+    length_gap = abs(len(full_name) - len(external_name))
+    same_name_length = len(full_name) == len(external_name)
 
     score_token_set = float(fuzz.token_set_ratio(full_name, external_name))
     score_partial = float(fuzz.partial_ratio(full_name, external_name))
     score_sort = float(fuzz.token_sort_ratio(full_name, external_name))
     score_prefix = float(fuzz.ratio(full_name[:max_external_chars], external_name[:max_external_chars]))
+    score_ordered_chars = ordered_character_ratio(full_name, external_name)
+    score_aligned_chars = aligned_character_ratio(full_name, external_name)
 
     score = (
-        0.35 * score_token_set
-        + 0.25 * score_partial
-        + 0.20 * score_sort
-        + 0.20 * score_prefix
+        weights["weight_token_set"] * score_token_set
+        + weights["weight_partial"] * score_partial
+        + weights["weight_sort"] * score_sort
+        + weights["weight_prefix"] * score_prefix
+        + weights["weight_ordered_chars"] * score_ordered_chars
+        + weights["weight_aligned_chars"] * score_aligned_chars
     )
     if same_first:
         score += 6
@@ -139,9 +192,28 @@ def score_candidate(full_name: str, external_name: str, max_external_chars: int)
         score += 8
     if starts_like:
         score += 4
+    if score_ordered_chars >= 94:
+        score += 3
+    if score_aligned_chars >= 88:
+        score += 2
+    score -= min(length_gap * float(config.get("length_gap_penalty_per_char", 0.5) if config else 0.5), float(config.get("max_length_gap_penalty", 10.0) if config else 10.0))
+    if same_first and not same_last and len(full_tokens) >= 2 and len(ext_tokens) >= 2:
+        score -= float(config.get("missing_surname_penalty", 3.0) if config else 3.0)
 
-    score = min(score, 100.0)
-    structure_ok = same_first and (same_last or ext_subset_in_full or score_token_set >= 88)
+    score = min(max(score, 0.0), 100.0)
+    structure_ok = same_first and (
+        same_last
+        or ext_subset_in_full
+        or score_token_set >= 88
+        or score_ordered_chars >= 90
+        or score_aligned_chars >= 86
+    )
+    needs_length_review = bool(
+        same_first
+        and score_token_set >= 95.0
+        and (ext_subset_in_full or full_subset_in_ext or starts_like)
+        and (not same_name_length or score_aligned_chars < 100.0)
+    )
 
     return {
         "score": round(score, 2),
@@ -154,6 +226,11 @@ def score_candidate(full_name: str, external_name: str, max_external_chars: int)
         "score_partial": round(score_partial, 2),
         "score_sort": round(score_sort, 2),
         "score_prefix": round(score_prefix, 2),
+        "score_ordered_chars": round(score_ordered_chars, 2),
+        "score_aligned_chars": round(score_aligned_chars, 2),
+        "same_name_length": same_name_length,
+        "name_length_gap": length_gap,
+        "needs_length_review": needs_length_review,
         "structure_ok": structure_ok,
     }
 
@@ -199,9 +276,10 @@ def format_output_workbook(output_file: Path) -> None:
 
     header_fill = PatternFill("solid", fgColor="1F4E78")
     header_font = Font(color="FFFFFF", bold=True)
-    fill_accepted = PatternFill("solid", fgColor="D9EAD3")
-    fill_review = PatternFill("solid", fgColor="FFF2CC")
-    fill_no_match = PatternFill("solid", fgColor="F4CCCC")
+    fill_green_160 = PatternFill("solid", fgColor="A9D18E")
+    fill_green_220 = PatternFill("solid", fgColor="E2F0D9")
+    fill_blue_170 = PatternFill("solid", fgColor="9DC3E6")
+    fill_red_200 = PatternFill("solid", fgColor="F4CCCC")
     fill_summary = PatternFill("solid", fgColor="D9EAF7")
     fill_conflict = PatternFill("solid", fgColor="FCE5CD")
 
@@ -220,20 +298,35 @@ def format_output_workbook(output_file: Path) -> None:
                 for cell in row:
                     cell.fill = fill_summary
             continue
+        if ws.title == "t2_nao_utilizados":
+            for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+                for cell in row:
+                    cell.fill = fill_red_200
+            continue
 
         status_col = _find_header_index(ws, "final_status")
         conflict_col = _find_header_index(ws, "final_conflict_flags")
+        color_bucket_col = _find_header_index(ws, "final_color_bucket")
 
         for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
             fill = None
-            if status_col is not None:
+            color_bucket = str(row[color_bucket_col - 1].value or "").strip().upper() if color_bucket_col is not None else ""
+            if color_bucket == "GREEN_160":
+                fill = fill_green_160
+            elif color_bucket == "GREEN_220":
+                fill = fill_green_220
+            elif color_bucket == "BLUE_170":
+                fill = fill_blue_170
+            elif color_bucket == "RED_200":
+                fill = fill_red_200
+            elif status_col is not None:
                 status = str(row[status_col - 1].value or "").strip().upper()
                 if status == "ACEITO":
-                    fill = fill_accepted
+                    fill = fill_green_220
                 elif status == "REVISAR":
-                    fill = fill_review
+                    fill = fill_blue_170
                 elif status == "SEM_MATCH":
-                    fill = fill_no_match
+                    fill = fill_red_200
 
             if fill:
                 for cell in row:
@@ -324,8 +417,13 @@ def validate_config(config: dict[str, Any], validate_workbook: bool = True) -> d
     normalized["accept_score"] = float(normalized["accept_score"])
     normalized["review_score"] = float(normalized["review_score"])
     normalized["min_gap_for_accept"] = float(normalized["min_gap_for_accept"])
+    normalized["length_gap_penalty_per_char"] = float(normalized.get("length_gap_penalty_per_char", 0.5))
+    normalized["max_length_gap_penalty"] = float(normalized.get("max_length_gap_penalty", 10.0))
+    normalized["missing_surname_penalty"] = float(normalized.get("missing_surname_penalty", 3.0))
     normalized["allow_reuse_t2_matches"] = bool(normalized["allow_reuse_t2_matches"])
     normalized["auto_open_output"] = bool(normalized["auto_open_output"])
+    for key, default_value in DEFAULT_SCORE_WEIGHTS.items():
+        normalized[key] = float(normalized.get(key, default_value))
 
     if normalized["header_row_t1"] <= 0 or normalized["header_row_t2"] <= 0:
         raise ValueError("Header rows must be greater than zero.")
@@ -339,6 +437,14 @@ def validate_config(config: dict[str, Any], validate_workbook: bool = True) -> d
         raise ValueError("Accept score must be greater than or equal to review score.")
     if normalized["accept_score"] > 100 or normalized["review_score"] > 100:
         raise ValueError("Scores must be between 0 and 100.")
+    if normalized["length_gap_penalty_per_char"] < 0:
+        raise ValueError("Length gap penalty per char must be zero or greater.")
+    if normalized["max_length_gap_penalty"] < 0:
+        raise ValueError("Max length gap penalty must be zero or greater.")
+    if normalized["missing_surname_penalty"] < 0:
+        raise ValueError("Missing surname penalty must be zero or greater.")
+    if all(normalized[key] <= 0 for key in DEFAULT_SCORE_WEIGHTS):
+        raise ValueError("At least one score weight must be greater than zero.")
 
     excel_col_to_index(normalized["name_col_t1"])
     excel_col_to_index(normalized["name_col_t2"])
@@ -481,6 +587,10 @@ def candidate_utility(candidate: dict[str, Any]) -> int:
         utility += 300
     if candidate["ext_subset_in_full"] or candidate["full_subset_in_ext"]:
         utility += 250
+    if candidate["score_ordered_chars"] >= 90:
+        utility += 250
+    if candidate["score_aligned_chars"] >= 85:
+        utility += 180
     utility += max(0, 100 - int(candidate["rank"])) * 5
     return utility
 
@@ -610,6 +720,11 @@ def initialize_result_columns(results_df: pd.DataFrame, top_candidates_to_keep: 
         "final_line_match_t2": pd.NA,
         "final_score": pd.NA,
         "final_score_gap": pd.NA,
+        "final_score_ordered_chars": pd.NA,
+        "final_score_aligned_chars": pd.NA,
+        "final_name_length_gap": pd.NA,
+        "final_same_name_length": pd.NA,
+        "final_color_bucket": "",
         "final_conflict_flags": "",
         "final_review_required": False,
         "final_quota_limit": pd.NA,
@@ -633,7 +748,7 @@ def analyze_matching(config: dict[str, Any], progress_callback: ProgressCallback
         results_df["analysis_status"] = "SEM_MATCH"
         results_df["analysis_method"] = "SEM_TABELA2"
         results_df["analysis_review_reason"] = "Table 2 does not contain normalized names."
-        recompute_final_state(results_df, pd.DataFrame(columns=catalog_df.columns))
+        recompute_final_state(results_df, pd.DataFrame(columns=catalog_df.columns), config=config)
         summary_df = build_summary(results_df)
         return AnalysisResult(
             config=config,
@@ -674,7 +789,12 @@ def analyze_matching(config: dict[str, Any], progress_callback: ProgressCallback
         )
         scored: list[dict[str, Any]] = []
         for record in pool:
-            metrics = score_candidate(name_norm, str(record["nome_t2_norm"]), config["max_external_chars"])
+            metrics = score_candidate(
+                name_norm,
+                str(record["nome_t2_norm"]),
+                config["max_external_chars"],
+                config=config,
+            )
             exact_norm = name_norm == record["nome_t2_norm"]
             exact_prefix = bool(row["key_prefix"]) and str(row["key_prefix"]) == str(record["key_prefix"])
             scored.append(
@@ -699,6 +819,8 @@ def analyze_matching(config: dict[str, Any], progress_callback: ProgressCallback
                 item["score"],
                 item["exact_norm"],
                 item["exact_prefix"],
+                item["score_ordered_chars"],
+                item["score_aligned_chars"],
                 item["same_last"],
             ),
             reverse=True,
@@ -727,6 +849,7 @@ def analyze_matching(config: dict[str, Any], progress_callback: ProgressCallback
                         and gap_to_next >= config["min_gap_for_accept"]
                     )
                 )
+                and not candidate["needs_length_review"]
             )
             candidate["utility"] = candidate_utility(candidate)
             candidate_rows.append(candidate)
@@ -784,6 +907,7 @@ def analyze_matching(config: dict[str, Any], progress_callback: ProgressCallback
                 add_flag(flags, "STRUCTURE_WARNING", best["score"] >= config["accept_score"] and not best["structure_ok"])
                 add_flag(flags, "QUOTA_CONFLICT", bool(eligible_counts.get(source_row_id)) and assigned is None)
                 add_flag(flags, "GLOBAL_REALLOCATED", assigned is not None and int(assigned["rank"]) > 1)
+                add_flag(flags, "LENGTH_POSITION_REVIEW", bool(best.get("needs_length_review", False)))
 
                 chosen = assigned if assigned is not None else best
                 results_df.at[row_index, "analysis_match_t2_original"] = chosen["nome_t2_original"]
@@ -806,11 +930,17 @@ def analyze_matching(config: dict[str, Any], progress_callback: ProgressCallback
                         reasons.append("Global assignment used a fallback candidate.")
                     if best["gap_to_next"] < config["min_gap_for_accept"]:
                         reasons.append("Primary candidate gap is below the auto-accept threshold.")
+                    if bool(best.get("needs_length_review", False)):
+                        reasons.append("Similarity reached the top score, but name length or character position is not a full match.")
                     results_df.at[row_index, "analysis_review_reason"] = " ".join(reasons) or "Global fallback should be reviewed."
                 elif bool(eligible_counts.get(source_row_id)):
                     results_df.at[row_index, "analysis_status"] = "REVISAR"
                     results_df.at[row_index, "analysis_method"] = "QUOTA_CONFLICT"
                     results_df.at[row_index, "analysis_review_reason"] = "Strong candidate lost quota in the global assignment."
+                elif bool(best.get("needs_length_review", False)):
+                    results_df.at[row_index, "analysis_status"] = "REVISAR"
+                    results_df.at[row_index, "analysis_method"] = "LENGTH_POSITION_REVIEW"
+                    results_df.at[row_index, "analysis_review_reason"] = "Similarity is very high, but length or character-position agreement is incomplete."
                 elif bool(best["review_eligible"]):
                     results_df.at[row_index, "analysis_status"] = "REVISAR"
                     results_df.at[row_index, "analysis_method"] = "FUZZY_REVIEW"
@@ -823,7 +953,7 @@ def analyze_matching(config: dict[str, Any], progress_callback: ProgressCallback
         results_df.at[row_index, "analysis_conflict_flags"] = flags_to_text(flags)
 
     emit_progress(progress_callback, "Applying final state defaults...", 88)
-    recompute_final_state(results_df, catalog_df)
+    recompute_final_state(results_df, catalog_df, config=config)
     summary_df = build_summary(results_df)
     review_df = results_df[results_df["final_status"] == "REVISAR"].copy()
     preview_columns = [
@@ -868,7 +998,33 @@ def build_quota_summary(results_df: pd.DataFrame, catalog_df: pd.DataFrame) -> p
     return quota_df.sort_values(["is_full", "nome_t2_original"], ascending=[False, True]).reset_index(drop=True)
 
 
-def recompute_final_state(results_df: pd.DataFrame, catalog_df: pd.DataFrame) -> None:
+def determine_color_bucket(
+    final_status: str,
+    final_score: Any,
+    ordered_score: float,
+    aligned_score: float,
+    same_name_length: bool,
+    config: dict[str, Any] | None = None,
+) -> str:
+    score_value = safe_float(final_score) or 0.0
+    review_floor = float(config.get("review_score", 85.0)) if config else 85.0
+
+    if final_status == "SEM_MATCH":
+        return "RED_200"
+    if score_value >= 99.5 and same_name_length and ordered_score >= 99.5 and aligned_score >= 99.5:
+        return "GREEN_160"
+    if score_value >= 99.5:
+        return "GREEN_220"
+    if review_floor <= score_value < 99.5:
+        return "BLUE_170"
+    return ""
+
+
+def recompute_final_state(
+    results_df: pd.DataFrame,
+    catalog_df: pd.DataFrame,
+    config: dict[str, Any] | None = None,
+) -> None:
     quota_map = (
         catalog_df.set_index("nome_t2_norm")["quota_limit"].astype(int).to_dict()
         if not catalog_df.empty
@@ -1004,6 +1160,30 @@ def recompute_final_state(results_df: pd.DataFrame, catalog_df: pd.DataFrame) ->
         results_df.at[row_index, "final_line_match_t2"] = row["final_line_match_t2"] if final_status != "SEM_MATCH" else pd.NA
         results_df.at[row_index, "final_score"] = row["final_score"] if final_status != "SEM_MATCH" else pd.NA
         results_df.at[row_index, "final_score_gap"] = row["final_score_gap"] if final_status != "SEM_MATCH" else pd.NA
+        source_norm = str(results_df.at[row_index, "nome_t1_norm"] or "")
+        final_norm_for_metrics = str(results_df.at[row_index, "final_match_t2_norm"] or "")
+        if final_status != "SEM_MATCH" and final_norm_for_metrics:
+            ordered_score = ordered_character_ratio(source_norm, final_norm_for_metrics)
+            aligned_score = aligned_character_ratio(source_norm, final_norm_for_metrics)
+            length_gap = abs(len(source_norm) - len(final_norm_for_metrics))
+            same_name_length = len(source_norm) == len(final_norm_for_metrics)
+        else:
+            ordered_score = 0.0
+            aligned_score = 0.0
+            length_gap = pd.NA
+            same_name_length = pd.NA
+        results_df.at[row_index, "final_score_ordered_chars"] = ordered_score if final_status != "SEM_MATCH" else pd.NA
+        results_df.at[row_index, "final_score_aligned_chars"] = aligned_score if final_status != "SEM_MATCH" else pd.NA
+        results_df.at[row_index, "final_name_length_gap"] = length_gap
+        results_df.at[row_index, "final_same_name_length"] = same_name_length
+        results_df.at[row_index, "final_color_bucket"] = determine_color_bucket(
+            final_status,
+            row["final_score"] if final_status != "SEM_MATCH" else pd.NA,
+            ordered_score,
+            aligned_score,
+            bool(same_name_length) if pd.notna(same_name_length) else False,
+            config=config,
+        )
         results_df.at[row_index, "final_conflict_flags"] = flags_to_text(final_flags)
         results_df.at[row_index, "final_review_required"] = final_status == "REVISAR"
         results_df.at[row_index, "final_quota_limit"] = quota_limit if quota_limit is not None else pd.NA
@@ -1022,7 +1202,7 @@ def export_analysis_result(
     output_path = Path(config["output_file"])
 
     emit_progress(progress_callback, "Refreshing final state before export...", 10)
-    recompute_final_state(result.results_df, result.catalog_df)
+    recompute_final_state(result.results_df, result.catalog_df, config=result.config)
     result.summary_df = build_summary(result.results_df)
     result.review_df = result.results_df[result.results_df["final_status"] == "REVISAR"].copy()
     result.preview_df = result.results_df.head(40).copy()
@@ -1035,14 +1215,18 @@ def export_analysis_result(
     used_targets = set(accepted_df["final_match_t2_norm"].dropna().astype(str))
     full_catalog = build_export_catalog(result)
     unused_targets_df = full_catalog[~full_catalog["nome_t2_norm"].isin(used_targets)].copy() if not full_catalog.empty else pd.DataFrame()
+    export_all_df = build_ordered_export_df(result.results_df)
+    export_accepted_df = build_ordered_export_df(accepted_df)
+    export_review_df = build_ordered_export_df(review_df)
+    export_sem_match_df = build_ordered_export_df(sem_match_df)
 
     emit_progress(progress_callback, "Writing Excel workbook...", 55)
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         result.summary_df.to_excel(writer, sheet_name="resumo", index=False)
-        result.results_df.to_excel(writer, sheet_name="resultados_todos", index=False)
-        accepted_df.to_excel(writer, sheet_name="aceitos", index=False)
-        review_df.to_excel(writer, sheet_name="revisao_pendente", index=False)
-        sem_match_df.to_excel(writer, sheet_name="sem_match", index=False)
+        export_all_df.to_excel(writer, sheet_name="resultados_todos", index=False)
+        export_accepted_df.to_excel(writer, sheet_name="aceitos", index=False)
+        export_review_df.to_excel(writer, sheet_name="revisao_pendente", index=False)
+        export_sem_match_df.to_excel(writer, sheet_name="sem_match", index=False)
         conflicts_df.to_excel(writer, sheet_name="conflitos", index=False)
         result.quota_df.to_excel(writer, sheet_name="quotas_t2", index=False)
         result.candidates_df.to_excel(writer, sheet_name="candidatos", index=False)
@@ -1061,6 +1245,65 @@ def build_export_catalog(result: AnalysisResult) -> pd.DataFrame:
     return result.catalog_df.copy()
 
 
+def natural_sort_key(value: str) -> list[Any]:
+    text = str(value)
+    return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", text)]
+
+
+def pick_primary_date_column(df: pd.DataFrame, columns: list[str]) -> str | None:
+    best_column = None
+    best_score = -1.0
+    for column in columns:
+        if column not in df.columns:
+            continue
+        parsed = pd.to_datetime(df[column], errors="coerce", dayfirst=True, format="mixed")
+        valid_ratio = float(parsed.notna().mean()) if len(parsed) else 0.0
+        if valid_ratio < 0.4:
+            continue
+        name = normalize_name(column)
+        score = valid_ratio
+        if "ATEND" in name or "DATA" in name or "DATE" in name or "LAUDO" in name or "ESTUDO" in name:
+            score += 1.5
+        if "NASC" in name or "BIRTH" in name:
+            score -= 1.0
+        if score > best_score:
+            best_score = score
+            best_column = column
+    return best_column
+
+
+def build_ordered_export_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+
+    source_columns: list[str] = []
+    for column in df.columns:
+        if column == "source_row_id":
+            break
+        source_columns.append(column)
+
+    primary_columns = [column for column in ("nome_t1_original", "final_match_t2_original") if column in df.columns]
+    remaining_source = [column for column in source_columns if column not in primary_columns]
+    helper_columns = [column for column in df.columns if column not in primary_columns and column not in remaining_source]
+
+    ordered_columns = (
+        primary_columns
+        + sorted(remaining_source, key=natural_sort_key)
+        + sorted(helper_columns, key=natural_sort_key)
+    )
+    ordered_df = df.loc[:, ordered_columns].copy()
+
+    date_column = pick_primary_date_column(ordered_df, remaining_source)
+    if date_column:
+        date_values = pd.to_datetime(ordered_df[date_column], errors="coerce", dayfirst=True, format="mixed")
+        ordered_df = (
+            ordered_df.assign(_sort_date=date_values)
+            .sort_values("_sort_date", ascending=False, kind="stable", na_position="last")
+            .drop(columns="_sort_date")
+        )
+    return ordered_df.reset_index(drop=True)
+
+
 def run_matching(config: dict[str, Any], progress_callback: ProgressCallback | None = None) -> Path:
     result = analyze_matching(config, progress_callback=progress_callback)
     return export_analysis_result(result, progress_callback=progress_callback)
@@ -1069,6 +1312,41 @@ def run_matching(config: dict[str, Any], progress_callback: ProgressCallback | N
 # =========================
 # GUI
 # =========================
+
+
+class ToolTip:
+    def __init__(self, widget, text: str) -> None:
+        self.widget = widget
+        self.text = text
+        self.tip_window: tk.Toplevel | None = None
+        self.widget.bind("<Enter>", self.show)
+        self.widget.bind("<Leave>", self.hide)
+
+    def show(self, _event=None) -> None:
+        if self.tip_window or not self.text:
+            return
+        x = self.widget.winfo_rootx() + 16
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 8
+        self.tip_window = tk.Toplevel(self.widget)
+        self.tip_window.wm_overrideredirect(True)
+        self.tip_window.wm_geometry(f"+{x}+{y}")
+        label = tk.Label(
+            self.tip_window,
+            text=self.text,
+            justify="left",
+            background="#FFF9D6",
+            relief="solid",
+            borderwidth=1,
+            padx=8,
+            pady=6,
+            wraplength=280,
+        )
+        label.pack()
+
+    def hide(self, _event=None) -> None:
+        if self.tip_window is not None:
+            self.tip_window.destroy()
+            self.tip_window = None
 
 
 class MatcherApp:
@@ -1098,10 +1376,25 @@ class MatcherApp:
             "allow_reuse_t2_matches": tk.BooleanVar(value=False),
             "max_matches_per_t2_name": tk.StringVar(value="3"),
             "auto_open_output": tk.BooleanVar(value=True),
+            "weight_token_set": tk.StringVar(value="27"),
+            "weight_partial": tk.StringVar(value="21"),
+            "weight_sort": tk.StringVar(value="15"),
+            "weight_prefix": tk.StringVar(value="15"),
+            "weight_ordered_chars": tk.StringVar(value="14"),
+            "weight_aligned_chars": tk.StringVar(value="8"),
+            "length_gap_penalty_per_char": tk.StringVar(value="0.5"),
+            "max_length_gap_penalty": tk.StringVar(value="10"),
+            "missing_surname_penalty": tk.StringVar(value="3"),
         }
         self.status_var = tk.StringVar(value="Ready.")
         self.progress_var = tk.DoubleVar(value=0.0)
         self.manual_note_var = tk.StringVar()
+        self.summary_card_vars = {
+            "total": tk.StringVar(value="0"),
+            "accepted": tk.StringVar(value="0"),
+            "review": tk.StringVar(value="0"),
+            "no_match": tk.StringVar(value="0"),
+        }
 
         self._build_ui()
 
@@ -1149,43 +1442,77 @@ class MatcherApp:
         self._add_file_row(files_frame, "Input workbook", "input_file", self.pick_input_file, 0)
         self._add_file_row(files_frame, "Output workbook", "output_file", self.pick_output_file, 1)
 
-        config_frame = ttk.LabelFrame(self.tab_config, text="Matching configuration", padding=10)
-        config_frame.pack(fill="x", pady=(0, 8))
-
-        fields = [
-            ("Sheet T1", "sheet_t1"),
-            ("Sheet T2", "sheet_t2"),
-            ("Header row T1", "header_row_t1"),
-            ("Header row T2", "header_row_t2"),
-            ("Name column T1", "name_col_t1"),
-            ("Name column T2", "name_col_t2"),
-            ("Prefix length", "max_external_chars"),
-            ("Accept score", "accept_score"),
-            ("Review score", "review_score"),
-            ("Min gap", "min_gap_for_accept"),
-            ("Preview candidates", "top_candidates_to_keep"),
-            ("Quota override", "max_matches_per_t2_name"),
+        workbook_frame = ttk.LabelFrame(self.tab_config, text="Workbook mapping", padding=10)
+        workbook_frame.pack(fill="x", pady=(0, 8))
+        workbook_fields = [
+            ("Sheet T1", "sheet_t1", "Worksheet that drives the output rows."),
+            ("Sheet T2", "sheet_t2", "Worksheet that provides candidate matches."),
+            ("Header row T1", "header_row_t1", "1-based row number where headers begin in Table 1."),
+            ("Header row T2", "header_row_t2", "1-based row number where headers begin in Table 2."),
+            ("Name column T1", "name_col_t1", "Excel column letter containing the Table 1 name."),
+            ("Name column T2", "name_col_t2", "Excel column letter containing the Table 2 name."),
         ]
-        for index, (label, key) in enumerate(fields):
+        for index, (label, key, tooltip) in enumerate(workbook_fields):
             row = index // 2
-            col = (index % 2) * 2
-            ttk.Label(config_frame, text=label).grid(row=row, column=col, sticky="w", padx=6, pady=5)
-            ttk.Entry(config_frame, textvariable=self.vars[key], width=24).grid(row=row, column=col + 1, sticky="ew", padx=6, pady=5)
-        config_frame.columnconfigure(1, weight=1)
-        config_frame.columnconfigure(3, weight=1)
+            col = (index % 2) * 3
+            self._add_setting_field(workbook_frame, row, col, label, key, tooltip)
+        for column in (1, 4):
+            workbook_frame.columnconfigure(column, weight=1)
 
-        options_frame = ttk.LabelFrame(self.tab_config, text="Options", padding=10)
-        options_frame.pack(fill="x", pady=(0, 8))
+        recommended_frame = ttk.LabelFrame(self.tab_config, text="Recommended defaults", padding=10)
+        recommended_frame.pack(fill="x", pady=(0, 8))
+        recommended_fields = [
+            ("Prefix length", "max_external_chars", "Compares the leading part of the normalized name and keeps compatibility with truncated external names."),
+            ("Accept score", "accept_score", "Candidates above this score can be auto-accepted when the structure and gap are also strong."),
+            ("Review score", "review_score", "Candidates above this score enter manual review when they are not safe enough for auto-accept."),
+            ("Min gap", "min_gap_for_accept", "Minimum lead over the next candidate required for safe auto-accept."),
+            ("Preview candidates", "top_candidates_to_keep", "How many candidate rows are retained for preview and manual review."),
+        ]
+        for index, (label, key, tooltip) in enumerate(recommended_fields):
+            row = index // 2
+            col = (index % 2) * 3
+            self._add_setting_field(recommended_frame, row, col, label, key, tooltip)
+        for column in (1, 4):
+            recommended_frame.columnconfigure(column, weight=1)
+
+        advanced_frame = ttk.LabelFrame(self.tab_config, text="Advanced controls", padding=10)
+        advanced_frame.pack(fill="x", pady=(0, 8))
+        self._add_setting_field(
+            advanced_frame,
+            0,
+            0,
+            "Quota override",
+            "max_matches_per_t2_name",
+            "Maximum reuse per normalized T2 name when reuse is enabled. The true quota remains quota-aware.",
+        )
+        advanced_frame.columnconfigure(1, weight=1)
+        advanced_weight_fields = [
+            ("Token weight", "weight_token_set", "How much token-set overlap influences the final score."),
+            ("Partial weight", "weight_partial", "How much partial substring similarity influences the final score."),
+            ("Sort weight", "weight_sort", "How much token order-insensitive similarity influences the final score."),
+            ("Prefix weight", "weight_prefix", "How much the configured prefix contributes to the final score."),
+            ("Ordered weight", "weight_ordered_chars", "How much ordered-character similarity contributes to the final score."),
+            ("Aligned weight", "weight_aligned_chars", "How much same-position character matching contributes to the final score."),
+            ("Length penalty", "length_gap_penalty_per_char", "Penalty applied per character of name-length difference."),
+            ("Max length penalty", "max_length_gap_penalty", "Maximum total penalty for a big difference in name length."),
+            ("Surname penalty", "missing_surname_penalty", "Penalty when the first name matches but the surname structure does not."),
+        ]
+        for index, (label, key, tooltip) in enumerate(advanced_weight_fields, start=1):
+            row = index // 2 + 2
+            col = ((index - 1) % 2) * 3
+            self._add_setting_field(advanced_frame, row, col, label, key, tooltip)
+        for column in (1, 4):
+            advanced_frame.columnconfigure(column, weight=1)
         ttk.Checkbutton(
-            options_frame,
+            advanced_frame,
             text="Allow T2 names to be reused up to quota override",
             variable=self.vars["allow_reuse_t2_matches"],
-        ).pack(anchor="w")
+        ).grid(row=1, column=0, columnspan=3, sticky="w", padx=6, pady=(6, 4))
         ttk.Checkbutton(
-            options_frame,
+            advanced_frame,
             text="Open exported workbook automatically",
             variable=self.vars["auto_open_output"],
-        ).pack(anchor="w", pady=(6, 0))
+        ).grid(row=1, column=3, columnspan=3, sticky="w", padx=6, pady=(6, 4))
 
         button_row = ttk.Frame(self.tab_config)
         button_row.pack(fill="x", pady=(0, 8))
@@ -1215,11 +1542,17 @@ class MatcherApp:
         content.add(preview_frame, weight=3)
         content.add(log_frame, weight=2)
 
-        self.summary_tree = ttk.Treeview(summary_frame, columns=("status", "qty", "pct"), show="headings", height=6)
-        for column, title, width in (("status", "Status", 180), ("qty", "Count", 100), ("pct", "Percent", 100)):
-            self.summary_tree.heading(column, text=title)
-            self.summary_tree.column(column, width=width, anchor="center")
-        self.summary_tree.pack(fill="both", expand=True)
+        cards = [
+            ("Total Rows", "total"),
+            ("Accepted", "accepted"),
+            ("Review", "review"),
+            ("No Match", "no_match"),
+        ]
+        for index, (label, key) in enumerate(cards):
+            card = ttk.LabelFrame(summary_frame, text=label, padding=10)
+            card.grid(row=0, column=index, sticky="nsew", padx=6, pady=4)
+            ttk.Label(card, textvariable=self.summary_card_vars[key], font=("Segoe UI", 18, "bold")).pack(anchor="center")
+            summary_frame.columnconfigure(index, weight=1)
 
         preview_columns = ("excel_row", "name", "analysis", "final", "match", "score", "flags")
         self.preview_tree = ttk.Treeview(preview_frame, columns=preview_columns, show="headings", height=14)
@@ -1269,12 +1602,14 @@ class MatcherApp:
         self.review_detail_text.pack(fill="x", pady=(0, 8))
 
         ttk.Label(detail_frame, text="Candidate preview").pack(anchor="w")
-        candidate_columns = ("rank", "candidate", "score", "auto", "review", "quota")
+        candidate_columns = ("rank", "candidate", "score", "ordered", "aligned", "auto", "review", "quota")
         self.candidate_tree = ttk.Treeview(detail_frame, columns=candidate_columns, show="headings", height=14)
         for column, title, width in (
             ("rank", "Rank", 60),
             ("candidate", "T2 Candidate", 260),
             ("score", "Score", 80),
+            ("ordered", "Ordered", 80),
+            ("aligned", "Aligned", 80),
             ("auto", "Auto", 70),
             ("review", "Review", 70),
             ("quota", "Quota", 90),
@@ -1312,6 +1647,21 @@ class MatcherApp:
         ttk.Entry(parent, textvariable=self.vars[var_key], width=96).grid(row=row, column=1, sticky="ew", padx=6, pady=5)
         ttk.Button(parent, text="Browse...", command=command).grid(row=row, column=2, padx=6, pady=5)
         parent.columnconfigure(1, weight=1)
+
+    def _add_setting_field(
+        self,
+        parent,
+        row: int,
+        col: int,
+        label: str,
+        var_key: str,
+        tooltip: str,
+    ) -> None:
+        ttk.Label(parent, text=label).grid(row=row, column=col, sticky="w", padx=6, pady=5)
+        ttk.Entry(parent, textvariable=self.vars[var_key], width=24).grid(row=row, column=col + 1, sticky="ew", padx=6, pady=5)
+        info = ttk.Label(parent, text="?", width=2, anchor="center")
+        info.grid(row=row, column=col + 2, sticky="w", padx=(0, 8), pady=5)
+        ToolTip(info, tooltip)
 
     def log(self, message: str) -> None:
         self.log_text.insert("end", message + "\n")
@@ -1427,12 +1777,14 @@ class MatcherApp:
         if self.analysis_result is None:
             return
 
-        for item in self.summary_tree.get_children():
-            self.summary_tree.delete(item)
         summary_df = build_summary(self.analysis_result.results_df)
         self.analysis_result.summary_df = summary_df
-        for row in summary_df.itertuples(index=False):
-            self.summary_tree.insert("", "end", values=(row.status, row.quantidade, f"{row.percentual:.2f}%"))
+        total_rows = len(self.analysis_result.results_df)
+        counts = summary_df.set_index("status")["quantidade"].to_dict() if not summary_df.empty else {}
+        self.summary_card_vars["total"].set(str(total_rows))
+        self.summary_card_vars["accepted"].set(str(int(counts.get("ACEITO", 0))))
+        self.summary_card_vars["review"].set(str(int(counts.get("REVISAR", 0))))
+        self.summary_card_vars["no_match"].set(str(int(counts.get("SEM_MATCH", 0))))
 
         for item in self.preview_tree.get_children():
             self.preview_tree.delete(item)
@@ -1456,7 +1808,7 @@ class MatcherApp:
         if self.analysis_result is None:
             return
 
-        recompute_final_state(self.analysis_result.results_df, self.catalog_df)
+        recompute_final_state(self.analysis_result.results_df, self.catalog_df, config=self.analysis_result.config)
         self.analysis_result.review_df = self.analysis_result.results_df[self.analysis_result.results_df["final_status"] == "REVISAR"].copy()
 
         for item in self.review_tree.get_children():
@@ -1523,6 +1875,8 @@ class MatcherApp:
                     getattr(candidate, "rank"),
                     getattr(candidate, "nome_t2_original"),
                     getattr(candidate, "score"),
+                    getattr(candidate, "score_ordered_chars"),
+                    getattr(candidate, "score_aligned_chars"),
                     "Y" if getattr(candidate, "eligible_for_global") else "",
                     "Y" if getattr(candidate, "review_eligible") else "",
                     quota_text,
@@ -1564,7 +1918,7 @@ class MatcherApp:
         self.analysis_result.results_df.loc[row_mask, "manual_score"] = candidate["score"]
         self.analysis_result.results_df.loc[row_mask, "manual_note"] = self.manual_note_var.get().strip()
         self.analysis_result.results_df.loc[row_mask, "manual_sequence"] = self.manual_sequence
-        recompute_final_state(self.analysis_result.results_df, self.catalog_df)
+        recompute_final_state(self.analysis_result.results_df, self.catalog_df, config=self.analysis_result.config)
         self.refresh_analysis_views()
         self.refresh_review_views()
         self.refresh_export_view()
@@ -1585,7 +1939,7 @@ class MatcherApp:
         self.analysis_result.results_df.loc[row_mask, "manual_score"] = pd.NA
         self.analysis_result.results_df.loc[row_mask, "manual_note"] = self.manual_note_var.get().strip()
         self.analysis_result.results_df.loc[row_mask, "manual_sequence"] = self.manual_sequence
-        recompute_final_state(self.analysis_result.results_df, self.catalog_df)
+        recompute_final_state(self.analysis_result.results_df, self.catalog_df, config=self.analysis_result.config)
         self.refresh_analysis_views()
         self.refresh_review_views()
         self.refresh_export_view()
@@ -1602,7 +1956,7 @@ class MatcherApp:
         self.analysis_result.results_df.loc[row_mask, "manual_status"] = "REVIEW"
         self.analysis_result.results_df.loc[row_mask, "manual_note"] = self.manual_note_var.get().strip()
         self.analysis_result.results_df.loc[row_mask, "manual_sequence"] = self.manual_sequence
-        recompute_final_state(self.analysis_result.results_df, self.catalog_df)
+        recompute_final_state(self.analysis_result.results_df, self.catalog_df, config=self.analysis_result.config)
         self.refresh_analysis_views()
         self.refresh_review_views()
         self.refresh_export_view()
@@ -1625,7 +1979,7 @@ class MatcherApp:
         self.analysis_result.results_df.loc[row_mask, "manual_line_match_t2"] = pd.NA
         self.analysis_result.results_df.loc[row_mask, "manual_score"] = pd.NA
         self.analysis_result.results_df.loc[row_mask, "manual_sequence"] = pd.NA
-        recompute_final_state(self.analysis_result.results_df, self.catalog_df)
+        recompute_final_state(self.analysis_result.results_df, self.catalog_df, config=self.analysis_result.config)
         self.refresh_analysis_views()
         self.refresh_review_views()
         self.refresh_export_view()
@@ -1637,7 +1991,7 @@ class MatcherApp:
             self.export_text.insert("1.0", "Run an analysis to populate export details.")
             return
 
-        recompute_final_state(self.analysis_result.results_df, self.catalog_df)
+        recompute_final_state(self.analysis_result.results_df, self.catalog_df, config=self.analysis_result.config)
         summary_df = build_summary(self.analysis_result.results_df)
         quota_df = build_quota_summary(self.analysis_result.results_df, self.catalog_df)
         unresolved = int((self.analysis_result.results_df["final_status"] == "REVISAR").sum())
