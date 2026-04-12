@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -18,10 +19,66 @@ from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill
 from rapidfuzz import fuzz
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox
+
+try:
+    import ttkbootstrap as ttk
+    from ttkbootstrap.dialogs import Messagebox as BootMessagebox
+
+    HAS_TTKBOOTSTRAP = True
+except Exception:
+    from tkinter import ttk
+
+    HAS_TTKBOOTSTRAP = False
+    BootMessagebox = None
 
 
 ProgressCallback = Callable[[str, float | None], None]
+APP_VERSION = "v2.1"
+UI_STATE_FILE = Path.home() / ".matcher_matcher_ui_state.json"
+QUICK_PRESETS = {
+    "Equilibrado": {
+        "accept_score": "92",
+        "review_score": "85",
+        "min_gap_for_accept": "4",
+        "top_candidates_to_keep": "5",
+        "allow_reuse_t2_matches": False,
+        "max_matches_per_t2_name": "3",
+    },
+    "Conservador": {
+        "accept_score": "95",
+        "review_score": "90",
+        "min_gap_for_accept": "6",
+        "top_candidates_to_keep": "4",
+        "allow_reuse_t2_matches": False,
+        "max_matches_per_t2_name": "2",
+    },
+    "Alta Cobertura": {
+        "accept_score": "90",
+        "review_score": "82",
+        "min_gap_for_accept": "3",
+        "top_candidates_to_keep": "7",
+        "allow_reuse_t2_matches": True,
+        "max_matches_per_t2_name": "4",
+    },
+}
+UI_COLORS = {
+    "bg": "#1E2A30",
+    "panel": "#263842",
+    "panel_alt": "#304751",
+    "card": "#354F5A",
+    "field": "#3E5B67",
+    "accent": "#2F80ED",
+    "accent_alt": "#20BF6B",
+    "text": "#E6F1F4",
+    "muted": "#A6BEC4",
+    "border": "#4E6873",
+    "btn_primary": "#2F80ED",
+    "btn_success": "#20BF6B",
+    "btn_warning": "#F39C12",
+    "btn_danger": "#E74C3C",
+    "btn_info": "#00A8CC",
+}
 DEFAULT_SCORE_WEIGHTS = {
     "weight_token_set": 27.0,
     "weight_partial": 21.0,
@@ -65,11 +122,11 @@ def emit_progress(callback: ProgressCallback | None, message: str, percent: floa
 def excel_col_to_index(col: str) -> int:
     col = str(col).strip().upper()
     if not col:
-        raise ValueError("Column letter cannot be empty.")
+        raise ValueError("A letra da coluna não pode ficar vazia.")
     value = 0
     for ch in col:
         if not ("A" <= ch <= "Z"):
-            raise ValueError(f"Invalid Excel column: {col}")
+            raise ValueError(f"Coluna do Excel inválida: {col}")
         value = value * 26 + (ord(ch) - ord("A") + 1)
     return value - 1
 
@@ -353,21 +410,21 @@ def open_file_with_default_app(path: Path) -> None:
 def collect_workbook_preview(config: dict[str, Any]) -> str:
     input_file = Path(config["input_file"])
     if not input_file.exists():
-        raise FileNotFoundError(f"Input file not found: {input_file}")
+        raise FileNotFoundError(f"Arquivo de entrada não encontrado: {input_file}")
 
     xls = pd.ExcelFile(input_file)
-    lines = [f"Workbook: {input_file}", f"Sheets: {', '.join(xls.sheet_names)}", ""]
+    lines = [f"Arquivo: {input_file}", f"Abas: {', '.join(xls.sheet_names)}", ""]
 
     for label, sheet_key, header_key, col_key in (
-        ("Table 1", "sheet_t1", "header_row_t1", "name_col_t1"),
-        ("Table 2", "sheet_t2", "header_row_t2", "name_col_t2"),
+        ("Tabela 1", "sheet_t1", "header_row_t1", "name_col_t1"),
+        ("Tabela 2", "sheet_t2", "header_row_t2", "name_col_t2"),
     ):
         sheet_name = config[sheet_key]
         header_row = int(config[header_key])
         name_col = config[col_key]
         lines.append(f"{label}:")
         if sheet_name not in xls.sheet_names:
-            lines.append(f"  - Missing sheet: {sheet_name}")
+            lines.append(f"  - Aba ausente: {sheet_name}")
             lines.append("")
             continue
 
@@ -379,15 +436,15 @@ def collect_workbook_preview(config: dict[str, Any]) -> str:
             nrows=5,
         )
         headers = [str(col) for col in preview_df.columns]
-        lines.append(f"  - Header row: {header_row}")
-        lines.append(f"  - Columns: {', '.join(headers[:15])}")
+        lines.append(f"  - Linha de cabeçalho: {header_row}")
+        lines.append(f"  - Colunas: {', '.join(headers[:15])}")
         selected_index = excel_col_to_index(name_col)
         if selected_index >= len(headers):
-            lines.append(f"  - Name column {name_col} is out of range")
+            lines.append(f"  - A coluna de nome {name_col} está fora do intervalo")
         else:
-            lines.append(f"  - Name column {name_col} -> {headers[selected_index]}")
+            lines.append(f"  - Coluna de nome {name_col} -> {headers[selected_index]}")
             sample_values = preview_df.iloc[:, selected_index].fillna("").astype(str).head(5).tolist()
-            lines.append(f"  - Sample values: {sample_values}")
+            lines.append(f"  - Valores de exemplo: {sample_values}")
         lines.append("")
     return "\n".join(lines).strip()
 
@@ -407,7 +464,7 @@ def validate_config(config: dict[str, Any], validate_workbook: bool = True) -> d
     ]
     for key in required_text:
         if not str(normalized.get(key, "")).strip():
-            raise ValueError(f"Field '{key}' cannot be empty.")
+            raise ValueError(f"O campo '{key}' não pode ficar vazio.")
 
     normalized["header_row_t1"] = int(normalized["header_row_t1"])
     normalized["header_row_t2"] = int(normalized["header_row_t2"])
@@ -426,25 +483,25 @@ def validate_config(config: dict[str, Any], validate_workbook: bool = True) -> d
         normalized[key] = float(normalized.get(key, default_value))
 
     if normalized["header_row_t1"] <= 0 or normalized["header_row_t2"] <= 0:
-        raise ValueError("Header rows must be greater than zero.")
+        raise ValueError("As linhas de cabeçalho devem ser maiores que zero.")
     if normalized["max_external_chars"] <= 0:
-        raise ValueError("Prefix length must be greater than zero.")
+        raise ValueError("O tamanho do prefixo deve ser maior que zero.")
     if normalized["top_candidates_to_keep"] <= 0:
-        raise ValueError("Top candidates to keep must be greater than zero.")
+        raise ValueError("A quantidade de candidatos para manter deve ser maior que zero.")
     if normalized["max_matches_per_t2_name"] <= 0:
-        raise ValueError("Quota override must be greater than zero.")
+        raise ValueError("O limite de reaproveitamento deve ser maior que zero.")
     if normalized["accept_score"] < normalized["review_score"]:
-        raise ValueError("Accept score must be greater than or equal to review score.")
+        raise ValueError("A pontuação de aceite deve ser maior ou igual à pontuação de revisão.")
     if normalized["accept_score"] > 100 or normalized["review_score"] > 100:
-        raise ValueError("Scores must be between 0 and 100.")
+        raise ValueError("As pontuações devem ficar entre 0 e 100.")
     if normalized["length_gap_penalty_per_char"] < 0:
-        raise ValueError("Length gap penalty per char must be zero or greater.")
+        raise ValueError("A penalidade por diferença de tamanho por caractere deve ser zero ou maior.")
     if normalized["max_length_gap_penalty"] < 0:
-        raise ValueError("Max length gap penalty must be zero or greater.")
+        raise ValueError("A penalidade máxima por diferença de tamanho deve ser zero ou maior.")
     if normalized["missing_surname_penalty"] < 0:
-        raise ValueError("Missing surname penalty must be zero or greater.")
+        raise ValueError("A penalidade por sobrenome ausente deve ser zero ou maior.")
     if all(normalized[key] <= 0 for key in DEFAULT_SCORE_WEIGHTS):
-        raise ValueError("At least one score weight must be greater than zero.")
+        raise ValueError("Pelo menos um peso de pontuação deve ser maior que zero.")
 
     excel_col_to_index(normalized["name_col_t1"])
     excel_col_to_index(normalized["name_col_t2"])
@@ -452,18 +509,18 @@ def validate_config(config: dict[str, Any], validate_workbook: bool = True) -> d
     input_file = Path(normalized["input_file"])
     if validate_workbook:
         if not input_file.exists():
-            raise FileNotFoundError(f"Input file not found: {input_file}")
+            raise FileNotFoundError(f"Arquivo de entrada não encontrado: {input_file}")
         xls = pd.ExcelFile(input_file)
         missing = [sheet for sheet in (normalized["sheet_t1"], normalized["sheet_t2"]) if sheet not in xls.sheet_names]
         if missing:
-            raise ValueError(f"Missing sheet(s): {', '.join(missing)}")
+            raise ValueError(f"Aba(s) ausente(s): {', '.join(missing)}")
 
     return normalized
 
 
 def prepare_input_frames(config: dict[str, Any], progress_callback: ProgressCallback | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
     input_file = Path(config["input_file"])
-    emit_progress(progress_callback, "Reading worksheets...", 5)
+    emit_progress(progress_callback, "Lendo abas da planilha...", 5)
     df1 = pd.read_excel(
         input_file,
         sheet_name=config["sheet_t1"],
@@ -480,11 +537,11 @@ def prepare_input_frames(config: dict[str, Any], progress_callback: ProgressCall
     idx_t1 = excel_col_to_index(config["name_col_t1"])
     idx_t2 = excel_col_to_index(config["name_col_t2"])
     if idx_t1 >= len(df1.columns):
-        raise IndexError(f"Column {config['name_col_t1']} does not exist in {config['sheet_t1']}.")
+        raise IndexError(f"A coluna {config['name_col_t1']} não existe em {config['sheet_t1']}.")
     if idx_t2 >= len(df2.columns):
-        raise IndexError(f"Column {config['name_col_t2']} does not exist in {config['sheet_t2']}.")
+        raise IndexError(f"A coluna {config['name_col_t2']} não existe em {config['sheet_t2']}.")
 
-    emit_progress(progress_callback, "Normalizing names and metadata...", 12)
+    emit_progress(progress_callback, "Normalizando nomes e metadados...", 12)
     df1 = df1.copy()
     df2 = df2.copy()
 
@@ -737,7 +794,7 @@ def initialize_result_columns(results_df: pd.DataFrame, top_candidates_to_keep: 
 
 def analyze_matching(config: dict[str, Any], progress_callback: ProgressCallback | None = None) -> AnalysisResult:
     config = validate_config(config, validate_workbook=True)
-    emit_progress(progress_callback, "Preparing analysis session...", 0)
+    emit_progress(progress_callback, "Preparando sessão de análise...", 0)
     df1, df2 = prepare_input_frames(config, progress_callback)
     catalog_df, target_indexes = build_target_catalog(df2, config)
 
@@ -747,7 +804,7 @@ def analyze_matching(config: dict[str, Any], progress_callback: ProgressCallback
     if catalog_df.empty:
         results_df["analysis_status"] = "SEM_MATCH"
         results_df["analysis_method"] = "SEM_TABELA2"
-        results_df["analysis_review_reason"] = "Table 2 does not contain normalized names."
+        results_df["analysis_review_reason"] = "A Tabela 2 não contém nomes normalizados."
         recompute_final_state(results_df, pd.DataFrame(columns=catalog_df.columns), config=config)
         summary_df = build_summary(results_df)
         return AnalysisResult(
@@ -762,14 +819,14 @@ def analyze_matching(config: dict[str, Any], progress_callback: ProgressCallback
         )
 
     candidate_rows: list[dict[str, Any]] = []
-    emit_progress(progress_callback, "Scoring candidate pools...", 18)
+    emit_progress(progress_callback, "Calculando pontuação dos grupos de candidatos...", 18)
     rows = list(results_df.index)
     internal_keep = max(config["top_candidates_to_keep"], 8)
 
     for position, row_index in enumerate(rows, start=1):
         if position % 50 == 0 or position == len(rows):
             percent = 18 + (position / max(len(rows), 1)) * 40
-            emit_progress(progress_callback, f"Scoring candidates {position}/{len(rows)}...", percent)
+            emit_progress(progress_callback, f"Pontuando candidatos {position}/{len(rows)}...", percent)
 
         row = results_df.loc[row_index]
         source_row_id = int(row["source_row_id"])
@@ -777,7 +834,7 @@ def analyze_matching(config: dict[str, Any], progress_callback: ProgressCallback
         if not name_norm:
             results_df.at[row_index, "analysis_status"] = "SEM_MATCH"
             results_df.at[row_index, "analysis_method"] = "SEM_DADO"
-            results_df.at[row_index, "analysis_review_reason"] = "Blank input name."
+            results_df.at[row_index, "analysis_review_reason"] = "Nome de entrada em branco."
             continue
 
         pool = choose_candidate_pool(
@@ -859,7 +916,7 @@ def analyze_matching(config: dict[str, Any], progress_callback: ProgressCallback
                 results_df.at[row_index, f"cand_{rank}_score"] = candidate["score"]
 
     candidates_df = pd.DataFrame(candidate_rows)
-    emit_progress(progress_callback, "Running global quota-aware assignment...", 62)
+    emit_progress(progress_callback, "Executando alocação global com controle de cotas...", 62)
 
     quota_limits = (
         catalog_df.set_index("nome_t2_norm")["quota_limit"].astype(int).to_dict()
@@ -890,7 +947,7 @@ def analyze_matching(config: dict[str, Any], progress_callback: ProgressCallback
         else {}
     )
 
-    emit_progress(progress_callback, "Classifying analysis outcomes...", 78)
+    emit_progress(progress_callback, "Classificando resultados da análise...", 78)
     for row_index in results_df.index:
         source_row_id = int(results_df.at[row_index, "source_row_id"])
         best = best_map.get(source_row_id)
@@ -901,7 +958,7 @@ def analyze_matching(config: dict[str, Any], progress_callback: ProgressCallback
             if not best:
                 results_df.at[row_index, "analysis_status"] = "SEM_MATCH"
                 results_df.at[row_index, "analysis_method"] = "SEM_CANDIDATO"
-                results_df.at[row_index, "analysis_review_reason"] = "No candidate generated."
+                results_df.at[row_index, "analysis_review_reason"] = "Nenhum candidato foi gerado."
             else:
                 add_flag(flags, "LOW_GAP", best["gap_to_next"] < config["min_gap_for_accept"] and not (best["exact_norm"] or best["exact_prefix"]))
                 add_flag(flags, "STRUCTURE_WARNING", best["score"] >= config["accept_score"] and not best["structure_ok"])
@@ -927,32 +984,32 @@ def analyze_matching(config: dict[str, Any], progress_callback: ProgressCallback
                     results_df.at[row_index, "analysis_method"] = "GLOBAL_REVIEW"
                     reasons = []
                     if int(assigned["rank"]) > 1:
-                        reasons.append("Global assignment used a fallback candidate.")
+                        reasons.append("A alocação global usou um candidato alternativo.")
                     if best["gap_to_next"] < config["min_gap_for_accept"]:
-                        reasons.append("Primary candidate gap is below the auto-accept threshold.")
+                        reasons.append("A diferença para o candidato seguinte ficou abaixo do limite de aceite automático.")
                     if bool(best.get("needs_length_review", False)):
-                        reasons.append("Similarity reached the top score, but name length or character position is not a full match.")
-                    results_df.at[row_index, "analysis_review_reason"] = " ".join(reasons) or "Global fallback should be reviewed."
+                        reasons.append("A similaridade atingiu pontuação máxima, mas o tamanho do nome ou a posição dos caracteres não confere totalmente.")
+                    results_df.at[row_index, "analysis_review_reason"] = " ".join(reasons) or "O candidato alternativo da alocação global deve ser revisado."
                 elif bool(eligible_counts.get(source_row_id)):
                     results_df.at[row_index, "analysis_status"] = "REVISAR"
                     results_df.at[row_index, "analysis_method"] = "QUOTA_CONFLICT"
-                    results_df.at[row_index, "analysis_review_reason"] = "Strong candidate lost quota in the global assignment."
+                    results_df.at[row_index, "analysis_review_reason"] = "Um candidato forte perdeu a cota na alocação global."
                 elif bool(best.get("needs_length_review", False)):
                     results_df.at[row_index, "analysis_status"] = "REVISAR"
                     results_df.at[row_index, "analysis_method"] = "LENGTH_POSITION_REVIEW"
-                    results_df.at[row_index, "analysis_review_reason"] = "Similarity is very high, but length or character-position agreement is incomplete."
+                    results_df.at[row_index, "analysis_review_reason"] = "A similaridade está muito alta, mas o tamanho ou o alinhamento de caracteres está incompleto."
                 elif bool(best["review_eligible"]):
                     results_df.at[row_index, "analysis_status"] = "REVISAR"
                     results_df.at[row_index, "analysis_method"] = "FUZZY_REVIEW"
-                    results_df.at[row_index, "analysis_review_reason"] = "Candidate needs manual confirmation."
+                    results_df.at[row_index, "analysis_review_reason"] = "O candidato precisa de confirmação manual."
                 else:
                     results_df.at[row_index, "analysis_status"] = "SEM_MATCH"
                     results_df.at[row_index, "analysis_method"] = "SEM_MATCH"
-                    results_df.at[row_index, "analysis_review_reason"] = "No candidate met the review threshold."
+                    results_df.at[row_index, "analysis_review_reason"] = "Nenhum candidato atingiu o limite mínimo para revisão."
 
         results_df.at[row_index, "analysis_conflict_flags"] = flags_to_text(flags)
 
-    emit_progress(progress_callback, "Applying final state defaults...", 88)
+    emit_progress(progress_callback, "Aplicando estado final padrão...", 88)
     recompute_final_state(results_df, catalog_df, config=config)
     summary_df = build_summary(results_df)
     review_df = results_df[results_df["final_status"] == "REVISAR"].copy()
@@ -966,7 +1023,7 @@ def analyze_matching(config: dict[str, Any], progress_callback: ProgressCallback
         "final_conflict_flags",
     ]
     preview_df = results_df[[col for col in preview_columns if col in results_df.columns]].head(40).copy()
-    emit_progress(progress_callback, "Analysis complete.", 100)
+    emit_progress(progress_callback, "Análise concluída.", 100)
     return AnalysisResult(
         config=config,
         results_df=results_df,
@@ -1201,7 +1258,7 @@ def export_analysis_result(
         config["output_file"] = str(output_file)
     output_path = Path(config["output_file"])
 
-    emit_progress(progress_callback, "Refreshing final state before export...", 10)
+    emit_progress(progress_callback, "Atualizando estado final antes da exportação...", 10)
     recompute_final_state(result.results_df, result.catalog_df, config=result.config)
     result.summary_df = build_summary(result.results_df)
     result.review_df = result.results_df[result.results_df["final_status"] == "REVISAR"].copy()
@@ -1220,7 +1277,7 @@ def export_analysis_result(
     export_review_df = build_ordered_export_df(review_df)
     export_sem_match_df = build_ordered_export_df(sem_match_df)
 
-    emit_progress(progress_callback, "Writing Excel workbook...", 55)
+    emit_progress(progress_callback, "Escrevendo arquivo Excel...", 55)
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         result.summary_df.to_excel(writer, sheet_name="resumo", index=False)
         export_all_df.to_excel(writer, sheet_name="resultados_todos", index=False)
@@ -1232,9 +1289,9 @@ def export_analysis_result(
         result.candidates_df.to_excel(writer, sheet_name="candidatos", index=False)
         unused_targets_df.to_excel(writer, sheet_name="t2_nao_utilizados", index=False)
 
-    emit_progress(progress_callback, "Formatting workbook...", 88)
+    emit_progress(progress_callback, "Formatando arquivo...", 88)
     format_output_workbook(output_path)
-    emit_progress(progress_callback, f"Export complete: {output_path}", 100)
+    emit_progress(progress_callback, f"Exportação concluída: {output_path}", 100)
     return output_path
 
 
@@ -1350,14 +1407,16 @@ class ToolTip:
 
 
 class MatcherApp:
-    def __init__(self, root: tk.Tk):
+    def __init__(self, root: Any):
         self.root = root
-        self.root.title("Matcher de Nomes - Analysis / Review / Export")
-        self.root.geometry("1320x920")
+        self.root.title(f"Matcher de Nomes - Análise / Revisão / Exportação {APP_VERSION}")
+        self.root.geometry("1480x980")
+        self.root.minsize(1260, 860)
         self.last_output_path: Path | None = None
         self.analysis_result: AnalysisResult | None = None
         self.catalog_df: pd.DataFrame = pd.DataFrame()
         self.manual_sequence = 0
+        self.last_manual_actions: list[str] = []
 
         self.vars: dict[str, tk.Variable] = {
             "input_file": tk.StringVar(),
@@ -1386,17 +1445,29 @@ class MatcherApp:
             "max_length_gap_penalty": tk.StringVar(value="10"),
             "missing_surname_penalty": tk.StringVar(value="3"),
         }
-        self.status_var = tk.StringVar(value="Ready.")
+        self.status_var = tk.StringVar(value="Pronto.")
         self.progress_var = tk.DoubleVar(value=0.0)
         self.manual_note_var = tk.StringVar()
+        self.quick_preset_var = tk.StringVar(value="Equilibrado")
+        self.config_mode_var = tk.StringVar(value="Básico")
+        self.review_filter_var = tk.StringVar(value="Todos")
+        self.review_search_var = tk.StringVar()
+        self.review_hint_var = tk.StringVar(value="Selecione uma linha da fila para ver motivos, candidatos e ações rápidas.")
+        self.export_snapshot_var = tk.StringVar(value="Nenhuma exportação executada nesta sessão.")
         self.summary_card_vars = {
             "total": tk.StringVar(value="0"),
             "accepted": tk.StringVar(value="0"),
             "review": tk.StringVar(value="0"),
             "no_match": tk.StringVar(value="0"),
         }
+        self.style = ttk.Style()
+        self._configure_styles()
 
         self._build_ui()
+        self._bind_shortcuts()
+        self.load_ui_state()
+        self.update_config_mode()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def _build_ui(self) -> None:
         container = ttk.Frame(self.root, padding=10)
@@ -1404,12 +1475,38 @@ class MatcherApp:
 
         header = ttk.Frame(container)
         header.pack(fill="x", pady=(0, 10))
-        ttk.Label(header, text="Matcher V2 Rewrite", font=("Segoe UI", 15, "bold")).pack(anchor="w")
+        title_row = ttk.Frame(header)
+        title_row.pack(fill="x")
+        title_text = "Matcher V2"
+        if HAS_TTKBOOTSTRAP:
+            title_text += " • ttkbootstrap"
+        ttk.Label(title_row, text=title_text, font=("Segoe UI", 16, "bold")).pack(side="left", anchor="w")
+        ttk.Button(title_row, text="Ajuda rápida", command=self.show_help, style="Info.TButton").pack(side="right", padx=(8, 0))
+        ttk.Button(title_row, text="Sobre", command=self.show_about, style="Primary.TButton").pack(side="right")
         ttk.Label(
             header,
-            text="Validation -> Analysis -> Manual Review -> Export",
+            text="Validação -> Análise -> Revisão Manual -> Exportação",
             font=("Segoe UI", 10),
         ).pack(anchor="w", pady=(2, 0))
+
+        command_row = ttk.LabelFrame(container, text="Ações rápidas", padding=10)
+        command_row.pack(fill="x", pady=(0, 10))
+        ttk.Label(command_row, text="Preset").pack(side="left")
+        preset_box = ttk.Combobox(
+            command_row,
+            textvariable=self.quick_preset_var,
+            values=list(QUICK_PRESETS.keys()),
+            state="readonly",
+            width=18,
+        )
+        preset_box.pack(side="left", padx=(8, 8))
+        ttk.Button(command_row, text="Aplicar preset", command=self.apply_quick_preset, style="Info.TButton").pack(side="left")
+        ttk.Button(command_row, text="Validar", command=self.validate_and_preview, style="Warning.TButton").pack(side="left", padx=(8, 0))
+        ttk.Button(command_row, text="Executar análise", command=self.start_analysis, style="Primary.TButton").pack(side="left", padx=(8, 0))
+        ttk.Button(command_row, text="Exportar", command=self.start_export, style="Success.TButton").pack(side="left", padx=(8, 0))
+        ttk.Label(command_row, text="Atalhos: Ctrl+O abrir | F5 validar | Ctrl+R analisar | Ctrl+E exportar").pack(
+            side="right"
+        )
 
         status_bar = ttk.Frame(container)
         status_bar.pack(fill="x", pady=(0, 10))
@@ -1424,33 +1521,355 @@ class MatcherApp:
         self.tab_review = ttk.Frame(self.notebook, padding=10)
         self.tab_export = ttk.Frame(self.notebook, padding=10)
 
-        self.notebook.add(self.tab_config, text="Configuration")
-        self.notebook.add(self.tab_analyze, text="Analyze")
-        self.notebook.add(self.tab_review, text="Review")
-        self.notebook.add(self.tab_export, text="Export")
+        self.notebook.add(self.tab_config, text="Configuração")
+        self.notebook.add(self.tab_analyze, text="Análise")
+        self.notebook.add(self.tab_review, text="Revisão")
+        self.notebook.add(self.tab_export, text="Exportação")
 
         self._build_config_tab()
         self._build_analyze_tab()
         self._build_review_tab()
         self._build_export_tab()
 
-        self.log("Application initialized.")
+        self.log("Aplicação iniciada.")
+
+    def _configure_styles(self) -> None:
+        try:
+            self.root.configure(background=UI_COLORS["bg"])
+            self.style.configure(".", background=UI_COLORS["bg"], foreground=UI_COLORS["text"])
+            self.style.configure("TFrame", background=UI_COLORS["bg"])
+            self.style.configure("TLabel", background=UI_COLORS["bg"], foreground=UI_COLORS["text"])
+            self.style.configure("TCheckbutton", background=UI_COLORS["bg"], foreground=UI_COLORS["text"])
+            self.style.configure(
+                "TLabelframe",
+                background=UI_COLORS["panel"],
+                bordercolor=UI_COLORS["border"],
+                relief="solid",
+                padding=8,
+            )
+            self.style.configure(
+                "TLabelframe.Label",
+                background=UI_COLORS["panel"],
+                foreground=UI_COLORS["accent"],
+                font=("Segoe UI", 10, "bold"),
+            )
+            self.style.configure(
+                "TNotebook",
+                background=UI_COLORS["bg"],
+                borderwidth=0,
+            )
+            self.style.configure(
+                "TNotebook.Tab",
+                padding=(14, 8),
+                background=UI_COLORS["panel"],
+                foreground=UI_COLORS["text"],
+            )
+            self.style.map(
+                "TNotebook.Tab",
+                background=[("selected", UI_COLORS["btn_primary"]), ("active", UI_COLORS["accent"])],
+                foreground=[("selected", "#FFFFFF"), ("active", "#FFFFFF")],
+            )
+            self.style.configure(
+                "TButton",
+                padding=(10, 6),
+                borderwidth=0,
+                background=UI_COLORS["panel_alt"],
+                foreground=UI_COLORS["text"],
+            )
+            self.style.map(
+                "TButton",
+                background=[("active", UI_COLORS["card"]), ("pressed", UI_COLORS["btn_primary"])],
+                foreground=[("active", UI_COLORS["text"]), ("pressed", "#FFFFFF")],
+            )
+            self.style.configure("Primary.TButton", background=UI_COLORS["btn_primary"], foreground="#FFFFFF")
+            self.style.map(
+                "Primary.TButton",
+                background=[("active", "#3F91F8"), ("pressed", "#2168C8")],
+                foreground=[("active", "#FFFFFF"), ("pressed", "#FFFFFF")],
+            )
+            self.style.configure("Success.TButton", background=UI_COLORS["btn_success"], foreground="#FFFFFF")
+            self.style.map(
+                "Success.TButton",
+                background=[("active", "#2BD97A"), ("pressed", "#149B54")],
+                foreground=[("active", "#FFFFFF"), ("pressed", "#FFFFFF")],
+            )
+            self.style.configure("Warning.TButton", background=UI_COLORS["btn_warning"], foreground="#FFFFFF")
+            self.style.map(
+                "Warning.TButton",
+                background=[("active", "#F6AD2C"), ("pressed", "#CF7E07")],
+                foreground=[("active", "#FFFFFF"), ("pressed", "#FFFFFF")],
+            )
+            self.style.configure("Danger.TButton", background=UI_COLORS["btn_danger"], foreground="#FFFFFF")
+            self.style.map(
+                "Danger.TButton",
+                background=[("active", "#EF5D4E"), ("pressed", "#C0392B")],
+                foreground=[("active", "#FFFFFF"), ("pressed", "#FFFFFF")],
+            )
+            self.style.configure("Info.TButton", background=UI_COLORS["btn_info"], foreground="#FFFFFF")
+            self.style.map(
+                "Info.TButton",
+                background=[("active", "#18BFE0"), ("pressed", "#0089A8")],
+                foreground=[("active", "#FFFFFF"), ("pressed", "#FFFFFF")],
+            )
+            self.style.configure(
+                "TEntry",
+                fieldbackground=UI_COLORS["field"],
+                background=UI_COLORS["field"],
+                foreground=UI_COLORS["text"],
+                bordercolor=UI_COLORS["border"],
+                lightcolor=UI_COLORS["field"],
+                darkcolor=UI_COLORS["field"],
+                insertcolor=UI_COLORS["text"],
+            )
+            self.style.configure(
+                "TCombobox",
+                fieldbackground=UI_COLORS["field"],
+                background=UI_COLORS["field"],
+                foreground=UI_COLORS["text"],
+                bordercolor=UI_COLORS["border"],
+                arrowcolor=UI_COLORS["text"],
+                lightcolor=UI_COLORS["field"],
+                darkcolor=UI_COLORS["field"],
+            )
+            self.style.map(
+                "TCombobox",
+                fieldbackground=[("readonly", UI_COLORS["field"])],
+                selectbackground=[("readonly", UI_COLORS["field"])],
+                selectforeground=[("readonly", UI_COLORS["text"])],
+            )
+            self.style.configure("Treeview", rowheight=30, font=("Segoe UI", 10))
+            self.style.configure("Treeview.Heading", font=("Segoe UI", 10, "bold"))
+            self.style.configure(
+                "Treeview",
+                rowheight=30,
+                font=("Segoe UI", 10),
+                background=UI_COLORS["card"],
+                fieldbackground=UI_COLORS["card"],
+                foreground=UI_COLORS["text"],
+                bordercolor=UI_COLORS["border"],
+            )
+            self.style.configure(
+                "Treeview.Heading",
+                font=("Segoe UI", 10, "bold"),
+                background=UI_COLORS["btn_primary"],
+                foreground="#FFFFFF",
+            )
+            self.style.map(
+                "Treeview",
+                background=[("selected", UI_COLORS["btn_info"])],
+                foreground=[("selected", "#FFFFFF")],
+            )
+        except Exception:
+            pass
+
+    def _bind_shortcuts(self) -> None:
+        self.root.bind_all("<Control-o>", lambda _event: self.pick_input_file())
+        self.root.bind_all("<F5>", lambda _event: self.validate_and_preview())
+        self.root.bind_all("<Control-r>", lambda _event: self.start_analysis())
+        self.root.bind_all("<Control-e>", lambda _event: self.start_export())
+        self.root.bind_all("<Control-s>", lambda _event: self.save_ui_state(show_feedback=True))
+
+    def _configure_status_tree(self, tree: Any) -> None:
+        tree.tag_configure("ACEITO", background="#24563D", foreground="#EAFBF2")
+        tree.tag_configure("REVISAR", background="#5A4B1E", foreground="#FFF5DA")
+        tree.tag_configure("SEM_MATCH", background="#503339", foreground="#FFECEF")
+        tree.tag_configure("CONFLITO", background="#2A4A63", foreground="#EAF6FF")
+
+    def _draw_summary_chart(self, canvas: tk.Canvas, values: dict[str, int]) -> None:
+        canvas.delete("all")
+        width = max(canvas.winfo_width(), 420)
+        height = max(canvas.winfo_height(), 120)
+        canvas.configure(scrollregion=(0, 0, width, height), background=UI_COLORS["panel_alt"])
+        total = max(sum(values.values()), 1)
+        items = [
+            ("ACEITO", values.get("ACEITO", 0), UI_COLORS["btn_success"]),
+            ("REVISAR", values.get("REVISAR", 0), UI_COLORS["btn_warning"]),
+            ("SEM_MATCH", values.get("SEM_MATCH", 0), UI_COLORS["btn_danger"]),
+        ]
+        start_x = 24
+        start_y = 22
+        bar_width = max(width - 220, 180)
+        for index, (label, value, color) in enumerate(items):
+            top = start_y + index * 30
+            ratio = value / total
+            canvas.create_text(
+                start_x,
+                top + 9,
+                text=label,
+                anchor="w",
+                font=("Segoe UI", 9, "bold"),
+                fill=UI_COLORS["text"],
+            )
+            canvas.create_rectangle(
+                start_x + 100,
+                top,
+                start_x + 100 + bar_width,
+                top + 18,
+                fill="#405965",
+                outline="",
+            )
+            canvas.create_rectangle(
+                start_x + 100,
+                top,
+                start_x + 100 + max(int(bar_width * ratio), 2 if value else 0),
+                top + 18,
+                fill=color,
+                outline="",
+            )
+            canvas.create_text(
+                start_x + 100 + bar_width + 12,
+                top + 9,
+                text=f"{value} ({ratio * 100:.1f}%)",
+                anchor="w",
+                font=("Segoe UI", 9),
+                fill=UI_COLORS["text"],
+            )
+
+    def _show_info(self, title: str, message: str) -> None:
+        if HAS_TTKBOOTSTRAP and BootMessagebox is not None:
+            try:
+                BootMessagebox.show_info(message, title=title, parent=self.root)
+                return
+            except Exception:
+                pass
+        messagebox.showinfo(title, message)
+
+    def _show_warning(self, title: str, message: str) -> None:
+        if HAS_TTKBOOTSTRAP and BootMessagebox is not None:
+            try:
+                BootMessagebox.show_warning(message, title=title, parent=self.root)
+                return
+            except Exception:
+                pass
+        messagebox.showwarning(title, message)
+
+    def _show_error(self, title: str, message: str) -> None:
+        if HAS_TTKBOOTSTRAP and BootMessagebox is not None:
+            try:
+                BootMessagebox.show_error(message, title=title, parent=self.root)
+                return
+            except Exception:
+                pass
+        messagebox.showerror(title, message)
+
+    def show_help(self) -> None:
+        self._show_info(
+            "Ajuda rápida",
+            "Fluxo sugerido:\n\n"
+            "1. Selecione a planilha de entrada.\n"
+            "2. Valide o mapeamento.\n"
+            "3. Execute a análise.\n"
+            "4. Revise os casos pendentes.\n"
+            "5. Exporte a planilha final.\n\n"
+            "Atalhos:\n"
+            "Ctrl+O abrir arquivo\n"
+            "F5 validar\n"
+            "Ctrl+R analisar\n"
+            "Ctrl+E exportar\n"
+            "Ctrl+S salvar configuração visual",
+        )
+
+    def show_about(self) -> None:
+        toolkit_name = "ttkbootstrap" if HAS_TTKBOOTSTRAP else "ttk padrão"
+        self._show_info(
+            "Sobre o Matcher",
+            f"Matcher de Nomes {APP_VERSION}\n\n"
+            f"Interface atual: {toolkit_name}\n"
+            "Objetivo: validar, analisar, revisar e exportar correspondências entre nomes de planilhas Excel.",
+        )
+
+    def apply_quick_preset(self) -> None:
+        preset = QUICK_PRESETS.get(self.quick_preset_var.get())
+        if not preset:
+            return
+        for key, value in preset.items():
+            variable = self.vars.get(key)
+            if variable is None:
+                continue
+            variable.set(value)
+        self.log(f"Preset aplicado: {self.quick_preset_var.get()}")
+        self.set_status(f"Preset '{self.quick_preset_var.get()}' aplicado.", None)
+
+    def update_config_mode(self, *_args: Any) -> None:
+        mode = self.config_mode_var.get()
+        if hasattr(self, "advanced_frame"):
+            if mode in {"Avançado", "Especialista"}:
+                self.advanced_frame.pack(fill="x", pady=(0, 8))
+            else:
+                self.advanced_frame.pack_forget()
+        if hasattr(self, "expert_frame"):
+            if mode == "Especialista":
+                self.expert_frame.pack(fill="x", pady=(0, 8))
+            else:
+                self.expert_frame.pack_forget()
+
+    def save_ui_state(self, show_feedback: bool = False) -> None:
+        payload = {
+            "vars": {key: variable.get() for key, variable in self.vars.items()},
+            "quick_preset": self.quick_preset_var.get(),
+            "config_mode": self.config_mode_var.get(),
+            "review_filter": self.review_filter_var.get(),
+        }
+        try:
+            UI_STATE_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            if show_feedback:
+                self.set_status("Configuração visual salva.", None)
+        except Exception as exc:
+            if show_feedback:
+                self._show_error("Salvar configuração", str(exc))
+
+    def load_ui_state(self) -> None:
+        if not UI_STATE_FILE.exists():
+            return
+        try:
+            payload = json.loads(UI_STATE_FILE.read_text(encoding="utf-8"))
+            for key, value in payload.get("vars", {}).items():
+                variable = self.vars.get(key)
+                if variable is not None:
+                    variable.set(value)
+            self.quick_preset_var.set(payload.get("quick_preset", self.quick_preset_var.get()))
+            self.config_mode_var.set(payload.get("config_mode", self.config_mode_var.get()))
+            self.review_filter_var.set(payload.get("review_filter", self.review_filter_var.get()))
+            self.log("Último estado visual carregado.")
+        except Exception as exc:
+            self.log(f"Não foi possível carregar o estado visual: {exc}")
+
+    def on_close(self) -> None:
+        self.save_ui_state()
+        self.root.destroy()
 
     def _build_config_tab(self) -> None:
-        files_frame = ttk.LabelFrame(self.tab_config, text="Files", padding=10)
-        files_frame.pack(fill="x", pady=(0, 8))
-        self._add_file_row(files_frame, "Input workbook", "input_file", self.pick_input_file, 0)
-        self._add_file_row(files_frame, "Output workbook", "output_file", self.pick_output_file, 1)
+        mode_frame = ttk.LabelFrame(self.tab_config, text="Modo de configuração", padding=10)
+        mode_frame.pack(fill="x", pady=(0, 8))
+        ttk.Label(mode_frame, text="Nível de detalhe").pack(side="left")
+        mode_box = ttk.Combobox(
+            mode_frame,
+            textvariable=self.config_mode_var,
+            values=["Básico", "Avançado", "Especialista"],
+            state="readonly",
+            width=18,
+        )
+        mode_box.pack(side="left", padx=(8, 12))
+        mode_box.bind("<<ComboboxSelected>>", self.update_config_mode)
+        ttk.Label(
+            mode_frame,
+            text="Básico mostra o essencial, Avançado libera cotas e Especialista expõe pesos finos.",
+        ).pack(side="left")
 
-        workbook_frame = ttk.LabelFrame(self.tab_config, text="Workbook mapping", padding=10)
+        files_frame = ttk.LabelFrame(self.tab_config, text="Arquivos", padding=10)
+        files_frame.pack(fill="x", pady=(0, 8))
+        self._add_file_row(files_frame, "Planilha de entrada", "input_file", self.pick_input_file, 0)
+        self._add_file_row(files_frame, "Planilha de saída", "output_file", self.pick_output_file, 1)
+
+        workbook_frame = ttk.LabelFrame(self.tab_config, text="Mapeamento da planilha", padding=10)
         workbook_frame.pack(fill="x", pady=(0, 8))
         workbook_fields = [
-            ("Sheet T1", "sheet_t1", "Worksheet that drives the output rows."),
-            ("Sheet T2", "sheet_t2", "Worksheet that provides candidate matches."),
-            ("Header row T1", "header_row_t1", "1-based row number where headers begin in Table 1."),
-            ("Header row T2", "header_row_t2", "1-based row number where headers begin in Table 2."),
-            ("Name column T1", "name_col_t1", "Excel column letter containing the Table 1 name."),
-            ("Name column T2", "name_col_t2", "Excel column letter containing the Table 2 name."),
+            ("Aba T1", "sheet_t1", "Aba que define as linhas de saída."),
+            ("Aba T2", "sheet_t2", "Aba que fornece os candidatos de correspondência."),
+            ("Linha de cabeçalho T1", "header_row_t1", "Número da linha (base 1) onde o cabeçalho começa na Tabela 1."),
+            ("Linha de cabeçalho T2", "header_row_t2", "Número da linha (base 1) onde o cabeçalho começa na Tabela 2."),
+            ("Coluna de nome T1", "name_col_t1", "Letra da coluna no Excel que contém o nome na Tabela 1."),
+            ("Coluna de nome T2", "name_col_t2", "Letra da coluna no Excel que contém o nome na Tabela 2."),
         ]
         for index, (label, key, tooltip) in enumerate(workbook_fields):
             row = index // 2
@@ -1459,14 +1878,14 @@ class MatcherApp:
         for column in (1, 4):
             workbook_frame.columnconfigure(column, weight=1)
 
-        recommended_frame = ttk.LabelFrame(self.tab_config, text="Recommended defaults", padding=10)
+        recommended_frame = ttk.LabelFrame(self.tab_config, text="Padrões recomendados", padding=10)
         recommended_frame.pack(fill="x", pady=(0, 8))
         recommended_fields = [
-            ("Prefix length", "max_external_chars", "Compares the leading part of the normalized name and keeps compatibility with truncated external names."),
-            ("Accept score", "accept_score", "Candidates above this score can be auto-accepted when the structure and gap are also strong."),
-            ("Review score", "review_score", "Candidates above this score enter manual review when they are not safe enough for auto-accept."),
-            ("Min gap", "min_gap_for_accept", "Minimum lead over the next candidate required for safe auto-accept."),
-            ("Preview candidates", "top_candidates_to_keep", "How many candidate rows are retained for preview and manual review."),
+            ("Tamanho do prefixo", "max_external_chars", "Compara o início do nome normalizado e mantém compatibilidade com nomes externos truncados."),
+            ("Pontuação de aceite", "accept_score", "Candidatos acima desta pontuação podem ser aceitos automaticamente quando estrutura e diferença também forem fortes."),
+            ("Pontuação de revisão", "review_score", "Candidatos acima desta pontuação entram em revisão manual quando não forem seguros para aceite automático."),
+            ("Diferença mínima", "min_gap_for_accept", "Diferença mínima para o próximo candidato necessária para aceite automático seguro."),
+            ("Candidatos em prévia", "top_candidates_to_keep", "Quantidade de candidatos mantidos para pré-visualização e revisão manual."),
         ]
         for index, (label, key, tooltip) in enumerate(recommended_fields):
             row = index // 2
@@ -1475,144 +1894,200 @@ class MatcherApp:
         for column in (1, 4):
             recommended_frame.columnconfigure(column, weight=1)
 
-        advanced_frame = ttk.LabelFrame(self.tab_config, text="Advanced controls", padding=10)
-        advanced_frame.pack(fill="x", pady=(0, 8))
+        self.advanced_frame = ttk.LabelFrame(self.tab_config, text="Controles avançados", padding=10)
         self._add_setting_field(
-            advanced_frame,
+            self.advanced_frame,
             0,
             0,
-            "Quota override",
+            "Limite de reaproveitamento",
             "max_matches_per_t2_name",
-            "Maximum reuse per normalized T2 name when reuse is enabled. The true quota remains quota-aware.",
+            "Máximo de reaproveitamento por nome normalizado da T2 quando o reaproveitamento estiver ativo. A cota real continua sendo respeitada.",
         )
-        advanced_frame.columnconfigure(1, weight=1)
+        self.advanced_frame.columnconfigure(1, weight=1)
+        self.advanced_frame.columnconfigure(4, weight=1)
+        ttk.Checkbutton(
+            self.advanced_frame,
+            text="Permitir reaproveitar nomes da T2 até o limite configurado",
+            variable=self.vars["allow_reuse_t2_matches"],
+        ).grid(row=1, column=0, columnspan=3, sticky="w", padx=6, pady=(6, 4))
+        ttk.Checkbutton(
+            self.advanced_frame,
+            text="Abrir automaticamente a planilha exportada",
+            variable=self.vars["auto_open_output"],
+        ).grid(row=1, column=3, columnspan=3, sticky="w", padx=6, pady=(6, 4))
+
+        self.expert_frame = ttk.LabelFrame(self.tab_config, text="Ajustes finos do algoritmo", padding=10)
         advanced_weight_fields = [
-            ("Token weight", "weight_token_set", "How much token-set overlap influences the final score."),
-            ("Partial weight", "weight_partial", "How much partial substring similarity influences the final score."),
-            ("Sort weight", "weight_sort", "How much token order-insensitive similarity influences the final score."),
-            ("Prefix weight", "weight_prefix", "How much the configured prefix contributes to the final score."),
-            ("Ordered weight", "weight_ordered_chars", "How much ordered-character similarity contributes to the final score."),
-            ("Aligned weight", "weight_aligned_chars", "How much same-position character matching contributes to the final score."),
-            ("Length penalty", "length_gap_penalty_per_char", "Penalty applied per character of name-length difference."),
-            ("Max length penalty", "max_length_gap_penalty", "Maximum total penalty for a big difference in name length."),
-            ("Surname penalty", "missing_surname_penalty", "Penalty when the first name matches but the surname structure does not."),
+            ("Peso token-set", "weight_token_set", "Quanto a sobreposição de tokens influencia a pontuação final."),
+            ("Peso parcial", "weight_partial", "Quanto a similaridade parcial de substring influencia a pontuação final."),
+            ("Peso sort", "weight_sort", "Quanto a similaridade sem considerar ordem dos tokens influencia a pontuação final."),
+            ("Peso prefixo", "weight_prefix", "Quanto o prefixo configurado contribui para a pontuação final."),
+            ("Peso ordenado", "weight_ordered_chars", "Quanto a similaridade de caracteres em ordem contribui para a pontuação final."),
+            ("Peso alinhado", "weight_aligned_chars", "Quanto a correspondência de caracteres na mesma posição contribui para a pontuação final."),
+            ("Penalidade de tamanho", "length_gap_penalty_per_char", "Penalidade aplicada por caractere de diferença no tamanho do nome."),
+            ("Penalidade máx. de tamanho", "max_length_gap_penalty", "Penalidade total máxima para grandes diferenças no tamanho do nome."),
+            ("Penalidade de sobrenome", "missing_surname_penalty", "Penalidade quando o primeiro nome bate, mas a estrutura de sobrenome não."),
         ]
         for index, (label, key, tooltip) in enumerate(advanced_weight_fields, start=1):
             row = index // 2 + 2
             col = ((index - 1) % 2) * 3
-            self._add_setting_field(advanced_frame, row, col, label, key, tooltip)
+            self._add_setting_field(self.expert_frame, row, col, label, key, tooltip)
         for column in (1, 4):
-            advanced_frame.columnconfigure(column, weight=1)
-        ttk.Checkbutton(
-            advanced_frame,
-            text="Allow T2 names to be reused up to quota override",
-            variable=self.vars["allow_reuse_t2_matches"],
-        ).grid(row=1, column=0, columnspan=3, sticky="w", padx=6, pady=(6, 4))
-        ttk.Checkbutton(
-            advanced_frame,
-            text="Open exported workbook automatically",
-            variable=self.vars["auto_open_output"],
-        ).grid(row=1, column=3, columnspan=3, sticky="w", padx=6, pady=(6, 4))
+            self.expert_frame.columnconfigure(column, weight=1)
 
         button_row = ttk.Frame(self.tab_config)
         button_row.pack(fill="x", pady=(0, 8))
-        ttk.Button(button_row, text="Autofill Output Name", command=self.autofill_output_name).pack(side="left")
-        ttk.Button(button_row, text="Validate + Preview Workbook", command=self.validate_and_preview).pack(side="left", padx=8)
-        ttk.Button(button_row, text="Start Analysis", command=self.start_analysis).pack(side="left", padx=8)
+        ttk.Button(button_row, text="Preencher nome de saída", command=self.autofill_output_name, style="Info.TButton").pack(side="left")
+        ttk.Button(button_row, text="Validar + Pré-visualizar planilha", command=self.validate_and_preview, style="Warning.TButton").pack(side="left", padx=8)
+        ttk.Button(button_row, text="Salvar configuração visual", command=lambda: self.save_ui_state(show_feedback=True), style="Primary.TButton").pack(side="left", padx=8)
+        ttk.Button(button_row, text="Iniciar análise", command=self.start_analysis, style="Success.TButton").pack(side="left", padx=8)
 
-        preview_frame = ttk.LabelFrame(self.tab_config, text="Validation preview", padding=10)
+        preview_frame = ttk.LabelFrame(self.tab_config, text="Prévia da validação", padding=10)
         preview_frame.pack(fill="both", expand=True)
-        self.validation_text = tk.Text(preview_frame, wrap="word", height=22)
+        self.validation_text = tk.Text(
+            preview_frame,
+            wrap="word",
+            height=22,
+            bg=UI_COLORS["field"],
+            fg=UI_COLORS["text"],
+            insertbackground=UI_COLORS["text"],
+            relief="flat",
+        )
         self.validation_text.pack(fill="both", expand=True)
 
     def _build_analyze_tab(self) -> None:
         actions = ttk.Frame(self.tab_analyze)
         actions.pack(fill="x", pady=(0, 8))
-        self.analyze_button = ttk.Button(actions, text="Run Analysis", command=self.start_analysis)
+        self.analyze_button = ttk.Button(actions, text="Executar análise", command=self.start_analysis, style="Primary.TButton")
         self.analyze_button.pack(side="left")
-        ttk.Button(actions, text="Refresh Preview", command=self.refresh_analysis_views).pack(side="left", padx=8)
+        ttk.Button(actions, text="Atualizar prévia", command=self.refresh_analysis_views, style="Info.TButton").pack(side="left", padx=8)
+        ttk.Label(actions, text="Visão rápida: cards + gráfico + tabela destacada por status.").pack(side="right")
 
         content = ttk.Panedwindow(self.tab_analyze, orient="vertical")
         content.pack(fill="both", expand=True)
 
-        summary_frame = ttk.LabelFrame(content, text="Summary", padding=8)
-        preview_frame = ttk.LabelFrame(content, text="Result preview", padding=8)
-        log_frame = ttk.LabelFrame(content, text="Analysis log", padding=8)
+        summary_frame = ttk.LabelFrame(content, text="Resumo", padding=8)
+        preview_frame = ttk.LabelFrame(content, text="Prévia de resultados", padding=8)
+        log_frame = ttk.LabelFrame(content, text="Log da análise", padding=8)
         content.add(summary_frame, weight=1)
         content.add(preview_frame, weight=3)
         content.add(log_frame, weight=2)
 
         cards = [
-            ("Total Rows", "total"),
-            ("Accepted", "accepted"),
-            ("Review", "review"),
-            ("No Match", "no_match"),
+            ("Total de Linhas", "total"),
+            ("Aceitos", "accepted"),
+            ("Revisão", "review"),
+            ("Sem Match", "no_match"),
         ]
         for index, (label, key) in enumerate(cards):
             card = ttk.LabelFrame(summary_frame, text=label, padding=10)
             card.grid(row=0, column=index, sticky="nsew", padx=6, pady=4)
             ttk.Label(card, textvariable=self.summary_card_vars[key], font=("Segoe UI", 18, "bold")).pack(anchor="center")
             summary_frame.columnconfigure(index, weight=1)
+        self.analysis_chart_canvas = tk.Canvas(
+            summary_frame,
+            height=116,
+            highlightthickness=0,
+            bg=UI_COLORS["panel_alt"],
+        )
+        self.analysis_chart_canvas.grid(row=1, column=0, columnspan=4, sticky="ew", padx=6, pady=(8, 0))
 
         preview_columns = ("excel_row", "name", "analysis", "final", "match", "score", "flags")
         self.preview_tree = ttk.Treeview(preview_frame, columns=preview_columns, show="headings", height=14)
         headers = {
-            "excel_row": "Row",
-            "name": "T1 Name",
-            "analysis": "Analysis",
+            "excel_row": "Linha",
+            "name": "Nome T1",
+            "analysis": "Análise",
             "final": "Final",
-            "match": "Suggested T2",
-            "score": "Score",
-            "flags": "Flags",
+            "match": "T2 Sugerido",
+            "score": "Pontuação",
+            "flags": "Sinalizadores",
         }
         widths = {"excel_row": 70, "name": 240, "analysis": 100, "final": 100, "match": 240, "score": 80, "flags": 260}
         for column in preview_columns:
             self.preview_tree.heading(column, text=headers[column])
             self.preview_tree.column(column, width=widths[column], anchor="w")
+        self._configure_status_tree(self.preview_tree)
         self.preview_tree.pack(fill="both", expand=True)
 
-        self.log_text = tk.Text(log_frame, wrap="word", height=10)
+        self.log_text = tk.Text(
+            log_frame,
+            wrap="word",
+            height=10,
+            bg=UI_COLORS["field"],
+            fg=UI_COLORS["text"],
+            insertbackground=UI_COLORS["text"],
+            relief="flat",
+        )
         self.log_text.pack(fill="both", expand=True)
 
     def _build_review_tab(self) -> None:
         layout = ttk.Panedwindow(self.tab_review, orient="horizontal")
         layout.pack(fill="both", expand=True)
 
-        queue_frame = ttk.LabelFrame(layout, text="Rows requiring review", padding=8)
-        detail_frame = ttk.LabelFrame(layout, text="Selected row details", padding=8)
+        queue_frame = ttk.LabelFrame(layout, text="Linhas que precisam de revisão", padding=8)
+        detail_frame = ttk.LabelFrame(layout, text="Detalhes da linha selecionada", padding=8)
         layout.add(queue_frame, weight=2)
         layout.add(detail_frame, weight=3)
+
+        queue_toolbar = ttk.Frame(queue_frame)
+        queue_toolbar.pack(fill="x", pady=(0, 8))
+        ttk.Label(queue_toolbar, text="Filtro").pack(side="left")
+        review_filter = ttk.Combobox(
+            queue_toolbar,
+            textvariable=self.review_filter_var,
+            values=["Todos", "Com conflito", "Gap baixo", "Realocado global", "Tamanho/posição", "Busca textual"],
+            state="readonly",
+            width=18,
+        )
+        review_filter.pack(side="left", padx=(8, 8))
+        review_filter.bind("<<ComboboxSelected>>", lambda _event: self.refresh_review_views())
+        ttk.Label(queue_toolbar, text="Busca").pack(side="left")
+        review_search_entry = ttk.Entry(queue_toolbar, textvariable=self.review_search_var, width=28)
+        review_search_entry.pack(side="left", padx=(8, 8))
+        review_search_entry.bind("<KeyRelease>", lambda _event: self.refresh_review_views())
+        ttk.Button(queue_toolbar, text="Limpar", command=self.clear_review_filters, style="Info.TButton").pack(side="left")
 
         queue_columns = ("row", "name", "status", "flags", "suggested")
         self.review_tree = ttk.Treeview(queue_frame, columns=queue_columns, show="headings", height=24)
         for column, title, width in (
-            ("row", "Row", 70),
-            ("name", "T1 Name", 220),
-            ("status", "Final Status", 110),
-            ("flags", "Flags", 230),
-            ("suggested", "Suggested T2", 220),
+            ("row", "Linha", 70),
+            ("name", "Nome T1", 220),
+            ("status", "Status Final", 110),
+            ("flags", "Sinalizadores", 230),
+            ("suggested", "T2 Sugerido", 220),
         ):
             self.review_tree.heading(column, text=title)
             self.review_tree.column(column, width=width, anchor="w")
+        self._configure_status_tree(self.review_tree)
         self.review_tree.pack(fill="both", expand=True)
         self.review_tree.bind("<<TreeviewSelect>>", self.on_review_row_selected)
 
-        ttk.Label(detail_frame, text="Row preview").pack(anchor="w")
-        self.review_detail_text = tk.Text(detail_frame, height=10, wrap="word")
+        ttk.Label(detail_frame, textvariable=self.review_hint_var, font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(0, 6))
+        ttk.Label(detail_frame, text="Prévia da linha").pack(anchor="w")
+        self.review_detail_text = tk.Text(
+            detail_frame,
+            height=10,
+            wrap="word",
+            bg=UI_COLORS["field"],
+            fg=UI_COLORS["text"],
+            insertbackground=UI_COLORS["text"],
+            relief="flat",
+        )
         self.review_detail_text.pack(fill="x", pady=(0, 8))
 
-        ttk.Label(detail_frame, text="Candidate preview").pack(anchor="w")
+        ttk.Label(detail_frame, text="Prévia de candidatos").pack(anchor="w")
         candidate_columns = ("rank", "candidate", "score", "ordered", "aligned", "auto", "review", "quota")
         self.candidate_tree = ttk.Treeview(detail_frame, columns=candidate_columns, show="headings", height=14)
         for column, title, width in (
             ("rank", "Rank", 60),
-            ("candidate", "T2 Candidate", 260),
-            ("score", "Score", 80),
-            ("ordered", "Ordered", 80),
-            ("aligned", "Aligned", 80),
+            ("candidate", "Candidato T2", 260),
+            ("score", "Pontuação", 80),
+            ("ordered", "Ordenado", 80),
+            ("aligned", "Alinhado", 80),
             ("auto", "Auto", 70),
-            ("review", "Review", 70),
-            ("quota", "Quota", 90),
+            ("review", "Revisão", 70),
+            ("quota", "Cota", 90),
         ):
             self.candidate_tree.heading(column, text=title)
             self.candidate_tree.column(column, width=width, anchor="w")
@@ -1620,32 +2095,48 @@ class MatcherApp:
 
         note_frame = ttk.Frame(detail_frame)
         note_frame.pack(fill="x", pady=(0, 8))
-        ttk.Label(note_frame, text="Manual note").pack(side="left")
+        ttk.Label(note_frame, text="Observação manual").pack(side="left")
         ttk.Entry(note_frame, textvariable=self.manual_note_var).pack(side="left", fill="x", expand=True, padx=(8, 0))
 
         buttons = ttk.Frame(detail_frame)
         buttons.pack(fill="x")
-        ttk.Button(buttons, text="Accept Selected Candidate", command=self.accept_selected_candidate).pack(side="left")
-        ttk.Button(buttons, text="Mark No Match", command=self.mark_selected_no_match).pack(side="left", padx=8)
-        ttk.Button(buttons, text="Keep In Review", command=self.keep_selected_in_review).pack(side="left")
-        ttk.Button(buttons, text="Reset Manual Decision", command=self.reset_manual_decision).pack(side="left", padx=8)
+        ttk.Button(buttons, text="Aceitar candidato selecionado", command=self.accept_selected_candidate, style="Success.TButton").pack(side="left")
+        ttk.Button(buttons, text="Marcar sem match", command=self.mark_selected_no_match, style="Danger.TButton").pack(side="left", padx=8)
+        ttk.Button(buttons, text="Manter em revisão", command=self.keep_selected_in_review, style="Warning.TButton").pack(side="left")
+        ttk.Button(buttons, text="Resetar decisão manual", command=self.reset_manual_decision, style="Info.TButton").pack(side="left", padx=8)
 
     def _build_export_tab(self) -> None:
         actions = ttk.Frame(self.tab_export)
         actions.pack(fill="x", pady=(0, 8))
-        self.export_button = ttk.Button(actions, text="Export Reviewed Results", command=self.start_export)
+        self.export_button = ttk.Button(actions, text="Exportar resultados revisados", command=self.start_export, style="Success.TButton")
         self.export_button.pack(side="left")
-        ttk.Button(actions, text="Open Last Export", command=self.open_last_output).pack(side="left", padx=8)
+        ttk.Button(actions, text="Abrir última exportação", command=self.open_last_output, style="Primary.TButton").pack(side="left", padx=8)
+        ttk.Label(actions, textvariable=self.export_snapshot_var).pack(side="right")
 
-        info_frame = ttk.LabelFrame(self.tab_export, text="Export status", padding=8)
+        info_frame = ttk.LabelFrame(self.tab_export, text="Status da exportação", padding=8)
         info_frame.pack(fill="both", expand=True)
-        self.export_text = tk.Text(info_frame, wrap="word", height=28)
+        self.export_chart_canvas = tk.Canvas(
+            info_frame,
+            height=116,
+            highlightthickness=0,
+            bg=UI_COLORS["panel_alt"],
+        )
+        self.export_chart_canvas.pack(fill="x", pady=(0, 8))
+        self.export_text = tk.Text(
+            info_frame,
+            wrap="word",
+            height=28,
+            bg=UI_COLORS["field"],
+            fg=UI_COLORS["text"],
+            insertbackground=UI_COLORS["text"],
+            relief="flat",
+        )
         self.export_text.pack(fill="both", expand=True)
 
     def _add_file_row(self, parent: ttk.LabelFrame, label: str, var_key: str, command: Callable[[], None], row: int) -> None:
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=6, pady=5)
         ttk.Entry(parent, textvariable=self.vars[var_key], width=96).grid(row=row, column=1, sticky="ew", padx=6, pady=5)
-        ttk.Button(parent, text="Browse...", command=command).grid(row=row, column=2, padx=6, pady=5)
+        ttk.Button(parent, text="Procurar...", command=command, style="Info.TButton").grid(row=row, column=2, padx=6, pady=5)
         parent.columnconfigure(1, weight=1)
 
     def _add_setting_field(
@@ -1663,6 +2154,11 @@ class MatcherApp:
         info.grid(row=row, column=col + 2, sticky="w", padx=(0, 8), pady=5)
         ToolTip(info, tooltip)
 
+    def clear_review_filters(self) -> None:
+        self.review_filter_var.set("Todos")
+        self.review_search_var.set("")
+        self.refresh_review_views()
+
     def log(self, message: str) -> None:
         self.log_text.insert("end", message + "\n")
         self.log_text.see("end")
@@ -1675,24 +2171,26 @@ class MatcherApp:
 
     def pick_input_file(self) -> None:
         path = filedialog.askopenfilename(
-            title="Select input workbook",
+            title="Selecionar planilha de entrada",
             filetypes=[("Excel", "*.xlsx *.xlsm *.xls")],
         )
         if path:
             self.vars["input_file"].set(path)
             self.autofill_output_name()
-            self.log(f"Input workbook selected: {path}")
+            self.save_ui_state()
+            self.log(f"Planilha de entrada selecionada: {path}")
 
     def pick_output_file(self) -> None:
         path = filedialog.asksaveasfilename(
-            title="Save output workbook as",
+            title="Salvar planilha de saída como",
             defaultextension=".xlsx",
             filetypes=[("Excel", "*.xlsx")],
             initialfile=Path(self.vars["output_file"].get() or "resultado_matching.xlsx").name,
         )
         if path:
             self.vars["output_file"].set(path)
-            self.log(f"Output workbook set to: {path}")
+            self.save_ui_state()
+            self.log(f"Planilha de saída definida para: {path}")
 
     def autofill_output_name(self) -> None:
         input_path = self.vars["input_file"].get().strip()
@@ -1714,22 +2212,24 @@ class MatcherApp:
             preview = collect_workbook_preview(config)
             self.validation_text.delete("1.0", "end")
             self.validation_text.insert("1.0", preview)
-            self.set_status("Workbook validation passed.", 0)
-            self.log("Workbook validation preview refreshed.")
+            self.set_status("Validação da planilha concluída com sucesso.", 0)
+            self.export_snapshot_var.set("Mapeamento validado e pronto para análise.")
+            self.save_ui_state()
+            self.log("Prévia da validação da planilha atualizada.")
             self.notebook.select(self.tab_config)
         except Exception as exc:
-            messagebox.showerror("Validation error", str(exc))
+            self._show_error("Erro de validação", str(exc))
 
     def start_analysis(self) -> None:
         try:
             config = validate_config(self.collect_config_from_vars(), validate_workbook=True)
         except Exception as exc:
-            messagebox.showerror("Validation error", str(exc))
+            self._show_error("Erro de validação", str(exc))
             return
 
         self.set_busy(True)
-        self.set_status("Starting analysis...", 0)
-        self.log("Starting analysis.")
+        self.set_status("Iniciando análise...", 0)
+        self.log("Iniciando análise.")
 
         def worker() -> None:
             try:
@@ -1758,20 +2258,20 @@ class MatcherApp:
         self.catalog_df = result.catalog_df.copy()
         self.last_output_path = None
         self.set_busy(False)
-        self.set_status("Analysis completed.", 100)
+        self.set_status("Análise concluída.", 100)
         self.refresh_analysis_views()
         self.refresh_review_views()
         self.refresh_export_view()
         self.notebook.select(self.tab_analyze)
-        self.log("Analysis completed successfully.")
+        self.log("Análise concluída com sucesso.")
 
     def on_background_error(self, error_message: str, tb: str) -> None:
         self.set_busy(False)
-        self.set_status("Operation failed.", 0)
-        self.log("ERROR:")
+        self.set_status("Operação falhou.", 0)
+        self.log("ERRO:")
         self.log(error_message)
         self.log(tb)
-        messagebox.showerror("Error", error_message)
+        self._show_error("Erro", error_message)
 
     def refresh_analysis_views(self) -> None:
         if self.analysis_result is None:
@@ -1785,11 +2285,15 @@ class MatcherApp:
         self.summary_card_vars["accepted"].set(str(int(counts.get("ACEITO", 0))))
         self.summary_card_vars["review"].set(str(int(counts.get("REVISAR", 0))))
         self.summary_card_vars["no_match"].set(str(int(counts.get("SEM_MATCH", 0))))
+        self._draw_summary_chart(self.analysis_chart_canvas, counts)
 
         for item in self.preview_tree.get_children():
             self.preview_tree.delete(item)
         preview_df = self.analysis_result.results_df.head(50)
         for row in preview_df.itertuples(index=False):
+            tag = getattr(row, "final_status", "") or getattr(row, "analysis_status", "")
+            if getattr(row, "final_conflict_flags", ""):
+                tag = "CONFLITO"
             self.preview_tree.insert(
                 "",
                 "end",
@@ -1802,6 +2306,7 @@ class MatcherApp:
                     getattr(row, "final_score", ""),
                     getattr(row, "final_conflict_flags", ""),
                 ),
+                tags=(tag,),
             )
 
     def refresh_review_views(self) -> None:
@@ -1809,11 +2314,28 @@ class MatcherApp:
             return
 
         recompute_final_state(self.analysis_result.results_df, self.catalog_df, config=self.analysis_result.config)
-        self.analysis_result.review_df = self.analysis_result.results_df[self.analysis_result.results_df["final_status"] == "REVISAR"].copy()
+        review_df = self.analysis_result.results_df[self.analysis_result.results_df["final_status"] == "REVISAR"].copy()
+        filter_value = self.review_filter_var.get()
+        search_value = normalize_name(self.review_search_var.get())
+        if filter_value == "Com conflito":
+            review_df = review_df[review_df["final_conflict_flags"].fillna("") != ""]
+        elif filter_value == "Gap baixo":
+            review_df = review_df[review_df["final_conflict_flags"].fillna("").str.contains("LOW_GAP", na=False)]
+        elif filter_value == "Realocado global":
+            review_df = review_df[review_df["final_conflict_flags"].fillna("").str.contains("GLOBAL_REALLOCATED", na=False)]
+        elif filter_value == "Tamanho/posição":
+            review_df = review_df[review_df["final_conflict_flags"].fillna("").str.contains("LENGTH_POSITION_REVIEW", na=False)]
+        if search_value:
+            review_df = review_df[
+                review_df["nome_t1_original"].fillna("").apply(normalize_name).str.contains(search_value, na=False)
+                | review_df["final_match_t2_original"].fillna("").apply(normalize_name).str.contains(search_value, na=False)
+            ]
+        self.analysis_result.review_df = review_df.copy()
 
         for item in self.review_tree.get_children():
             self.review_tree.delete(item)
         for row in self.analysis_result.review_df.itertuples(index=False):
+            tag = "CONFLITO" if getattr(row, "final_conflict_flags", "") else getattr(row, "final_status", "")
             self.review_tree.insert(
                 "",
                 "end",
@@ -1825,9 +2347,13 @@ class MatcherApp:
                     getattr(row, "final_conflict_flags", ""),
                     getattr(row, "final_match_t2_original", ""),
                 ),
+                tags=(tag,),
             )
 
         self.review_detail_text.delete("1.0", "end")
+        self.review_hint_var.set(
+            f"Pendências exibidas: {len(self.analysis_result.review_df)} • filtro atual: {self.review_filter_var.get()}"
+        )
         for item in self.candidate_tree.get_children():
             self.candidate_tree.delete(item)
 
@@ -1844,17 +2370,20 @@ class MatcherApp:
             return
         row = row_df.iloc[0]
         self.manual_note_var.set(str(row.get("manual_note", "") or ""))
+        self.review_hint_var.set(
+            f"Linha {row['excel_row_t1']} • status {row['final_status']} • sinalizadores: {row['final_conflict_flags'] or 'nenhum'}"
+        )
 
         details = [
-            f"Excel row: {row['excel_row_t1']}",
+            f"Linha no Excel: {row['excel_row_t1']}",
             f"T1 original: {row['nome_t1_original']}",
-            f"T1 normalized: {row['nome_t1_norm']}",
-            f"Analysis status: {row['analysis_status']}",
-            f"Analysis method: {row['analysis_method']}",
-            f"Suggested T2: {row['analysis_match_t2_original']}",
-            f"Suggested score: {row['analysis_score']}",
-            f"Review reason: {row['analysis_review_reason']}",
-            f"Conflict flags: {row['final_conflict_flags']}",
+            f"T1 normalizado: {row['nome_t1_norm']}",
+            f"Status da análise: {row['analysis_status']}",
+            f"Método da análise: {row['analysis_method']}",
+            f"T2 sugerido: {row['analysis_match_t2_original']}",
+            f"Pontuação sugerida: {row['analysis_score']}",
+            f"Motivo da revisão: {row['analysis_review_reason']}",
+            f"Sinalizadores de conflito: {row['final_conflict_flags']}",
         ]
         self.review_detail_text.delete("1.0", "end")
         self.review_detail_text.insert("1.0", "\n".join(details))
@@ -1867,6 +2396,7 @@ class MatcherApp:
         ].sort_values(["rank", "score"], ascending=[True, False])
         for candidate in candidates.itertuples(index=False):
             quota_text = f"{getattr(candidate, 'quota_limit', '')}"
+            candidate_tag = "ACEITO" if getattr(candidate, "rank") == 1 else ""
             self.candidate_tree.insert(
                 "",
                 "end",
@@ -1877,16 +2407,17 @@ class MatcherApp:
                     getattr(candidate, "score"),
                     getattr(candidate, "score_ordered_chars"),
                     getattr(candidate, "score_aligned_chars"),
-                    "Y" if getattr(candidate, "eligible_for_global") else "",
-                    "Y" if getattr(candidate, "review_eligible") else "",
+                    "S" if getattr(candidate, "eligible_for_global") else "",
+                    "S" if getattr(candidate, "review_eligible") else "",
                     quota_text,
                 ),
+                tags=(candidate_tag,),
             )
 
     def _selected_source_row_id(self) -> int | None:
         selection = self.review_tree.selection()
         if not selection:
-            messagebox.showwarning("Review", "Select a row from the review queue first.")
+            self._show_warning("Revisão", "Selecione primeiro uma linha da fila de revisão.")
             return None
         return int(selection[0])
 
@@ -1898,7 +2429,7 @@ class MatcherApp:
             return
         candidate_selection = self.candidate_tree.selection()
         if not candidate_selection:
-            messagebox.showwarning("Review", "Select a candidate to accept.")
+            self._show_warning("Revisão", "Selecione um candidato para aceitar.")
             return
 
         rank = int(candidate_selection[0].split(":")[1])
@@ -1919,10 +2450,12 @@ class MatcherApp:
         self.analysis_result.results_df.loc[row_mask, "manual_note"] = self.manual_note_var.get().strip()
         self.analysis_result.results_df.loc[row_mask, "manual_sequence"] = self.manual_sequence
         recompute_final_state(self.analysis_result.results_df, self.catalog_df, config=self.analysis_result.config)
+        self.last_manual_actions.insert(0, f"Linha {source_row_id}: aceite manual pelo candidato rank {rank}")
+        self.last_manual_actions = self.last_manual_actions[:8]
         self.refresh_analysis_views()
         self.refresh_review_views()
         self.refresh_export_view()
-        self.log(f"Manual accept applied to row {source_row_id} using candidate rank {rank}.")
+        self.log(f"Aceite manual aplicado à linha {source_row_id} usando o candidato rank {rank}.")
 
     def mark_selected_no_match(self) -> None:
         if self.analysis_result is None:
@@ -1940,10 +2473,12 @@ class MatcherApp:
         self.analysis_result.results_df.loc[row_mask, "manual_note"] = self.manual_note_var.get().strip()
         self.analysis_result.results_df.loc[row_mask, "manual_sequence"] = self.manual_sequence
         recompute_final_state(self.analysis_result.results_df, self.catalog_df, config=self.analysis_result.config)
+        self.last_manual_actions.insert(0, f"Linha {source_row_id}: marcada manualmente como sem match")
+        self.last_manual_actions = self.last_manual_actions[:8]
         self.refresh_analysis_views()
         self.refresh_review_views()
         self.refresh_export_view()
-        self.log(f"Row {source_row_id} manually marked as no match.")
+        self.log(f"Linha {source_row_id} marcada manualmente como sem match.")
 
     def keep_selected_in_review(self) -> None:
         if self.analysis_result is None:
@@ -1957,10 +2492,12 @@ class MatcherApp:
         self.analysis_result.results_df.loc[row_mask, "manual_note"] = self.manual_note_var.get().strip()
         self.analysis_result.results_df.loc[row_mask, "manual_sequence"] = self.manual_sequence
         recompute_final_state(self.analysis_result.results_df, self.catalog_df, config=self.analysis_result.config)
+        self.last_manual_actions.insert(0, f"Linha {source_row_id}: mantida em revisão")
+        self.last_manual_actions = self.last_manual_actions[:8]
         self.refresh_analysis_views()
         self.refresh_review_views()
         self.refresh_export_view()
-        self.log(f"Row {source_row_id} kept in manual review.")
+        self.log(f"Linha {source_row_id} mantida em revisão manual.")
 
     def reset_manual_decision(self) -> None:
         if self.analysis_result is None:
@@ -1980,15 +2517,17 @@ class MatcherApp:
         self.analysis_result.results_df.loc[row_mask, "manual_score"] = pd.NA
         self.analysis_result.results_df.loc[row_mask, "manual_sequence"] = pd.NA
         recompute_final_state(self.analysis_result.results_df, self.catalog_df, config=self.analysis_result.config)
+        self.last_manual_actions.insert(0, f"Linha {source_row_id}: decisão manual resetada")
+        self.last_manual_actions = self.last_manual_actions[:8]
         self.refresh_analysis_views()
         self.refresh_review_views()
         self.refresh_export_view()
-        self.log(f"Manual decision reset for row {source_row_id}.")
+        self.log(f"Decisão manual resetada para a linha {source_row_id}.")
 
     def refresh_export_view(self) -> None:
         self.export_text.delete("1.0", "end")
         if self.analysis_result is None:
-            self.export_text.insert("1.0", "Run an analysis to populate export details.")
+            self.export_text.insert("1.0", "Execute uma análise para preencher os detalhes da exportação.")
             return
 
         recompute_final_state(self.analysis_result.results_df, self.catalog_df, config=self.analysis_result.config)
@@ -1996,43 +2535,55 @@ class MatcherApp:
         quota_df = build_quota_summary(self.analysis_result.results_df, self.catalog_df)
         unresolved = int((self.analysis_result.results_df["final_status"] == "REVISAR").sum())
         conflict_count = int((self.analysis_result.results_df["final_conflict_flags"].fillna("") != "").sum())
-        lines = ["Current export state", "==================", ""]
+        counts = summary_df.set_index("status")["quantidade"].to_dict() if not summary_df.empty else {}
+        self._draw_summary_chart(self.export_chart_canvas, counts)
+        lines = ["Estado atual da exportação", "==========================", ""]
         for row in summary_df.itertuples(index=False):
             lines.append(f"{row.status}: {row.quantidade} ({row.percentual:.2f}%)")
         lines.extend(
             [
                 "",
-                f"Rows still in review: {unresolved}",
-                f"Rows with conflict flags: {conflict_count}",
-                f"Output workbook: {self.vars['output_file'].get()}",
+                f"Linhas ainda em revisão: {unresolved}",
+                f"Linhas com sinalizadores de conflito: {conflict_count}",
+                f"Planilha de saída: {self.vars['output_file'].get()}",
                 "",
-                "Top filled quotas:",
+                "Últimas decisões manuais:",
+            ]
+        )
+        if self.last_manual_actions:
+            lines.extend(f"- {item}" for item in self.last_manual_actions[:5])
+        else:
+            lines.append("- Nenhuma decisão manual registrada nesta sessão.")
+        lines.extend(
+            [
+                "",
+                "Cotas mais preenchidas:",
             ]
         )
         if quota_df.empty:
-            lines.append("- No T2 catalog available.")
+            lines.append("- Nenhum catálogo de T2 disponível.")
         else:
             top_quota = quota_df.sort_values(["accepted_count", "nome_t2_original"], ascending=[False, True]).head(10)
             for row in top_quota.itertuples(index=False):
                 lines.append(
-                    f"- {row.nome_t2_original}: {row.accepted_count}/{row.quota_limit} accepted"
+                    f"- {row.nome_t2_original}: {row.accepted_count}/{row.quota_limit} aceitos"
                 )
         self.export_text.insert("1.0", "\n".join(lines))
 
     def start_export(self) -> None:
         if self.analysis_result is None:
-            messagebox.showwarning("Export", "Run analysis before exporting.")
+            self._show_warning("Exportação", "Execute a análise antes de exportar.")
             return
         try:
             config = validate_config(self.collect_config_from_vars(), validate_workbook=False)
             self.analysis_result.config["output_file"] = config["output_file"]
         except Exception as exc:
-            messagebox.showerror("Export validation", str(exc))
+            self._show_error("Validação da exportação", str(exc))
             return
 
         self.set_busy(True)
-        self.set_status("Exporting workbook...", 0)
-        self.log("Starting export.")
+        self.set_status("Exportando planilha...", 0)
+        self.log("Iniciando exportação.")
 
         def worker() -> None:
             try:
@@ -2052,28 +2603,30 @@ class MatcherApp:
         self.set_busy(False)
         self.last_output_path = output_path
         self.refresh_export_view()
-        self.set_status(f"Export completed: {output_path}", 100)
-        self.log(f"Export completed: {output_path}")
+        self.export_snapshot_var.set(f"Última exportação: {output_path.name}")
+        self.save_ui_state()
+        self.set_status(f"Exportação concluída: {output_path}", 100)
+        self.log(f"Exportação concluída: {output_path}")
         if self.vars["auto_open_output"].get():
             try:
                 open_file_with_default_app(output_path)
-                self.log("Exported workbook opened automatically.")
+                self.log("Planilha exportada aberta automaticamente.")
             except Exception as exc:
-                self.log(f"Could not auto-open workbook: {exc}")
-        messagebox.showinfo("Export complete", f"Workbook generated:\n\n{output_path}")
+                self.log(f"Não foi possível abrir automaticamente a planilha: {exc}")
+        self._show_info("Exportação concluída", f"Planilha gerada:\n\n{output_path}")
 
     def open_last_output(self) -> None:
         if not self.last_output_path:
-            messagebox.showwarning("Open export", "No exported workbook is available yet.")
+            self._show_warning("Abrir exportação", "Ainda não há planilha exportada disponível.")
             return
         try:
             open_file_with_default_app(self.last_output_path)
         except Exception as exc:
-            messagebox.showerror("Open export", str(exc))
+            self._show_error("Abrir exportação", str(exc))
 
 
 def main() -> None:
-    root = tk.Tk()
+    root = ttk.Window(themename="darkly") if HAS_TTKBOOTSTRAP else tk.Tk()
     try:
         root.iconbitmap(default="")
     except Exception:
