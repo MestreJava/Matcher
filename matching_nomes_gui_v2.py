@@ -19,7 +19,7 @@ from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill
 from rapidfuzz import fuzz
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import colorchooser, filedialog, messagebox
 
 try:
     import ttkbootstrap as ttk
@@ -79,6 +79,13 @@ UI_COLORS = {
     "btn_danger": "#E74C3C",
     "btn_info": "#00A8CC",
 }
+DEFAULT_MATCH_COLORS = {
+    "color_exact": "FF4CAF50",
+    "color_match": "FF2F80ED",
+    "color_review": "FFF39C12",
+    "color_no_match": "FFE57373",
+    "color_excess_left": "FF64B5F6",
+}
 DEFAULT_SCORE_WEIGHTS = {
     "weight_token_set": 27.0,
     "weight_partial": 21.0,
@@ -104,6 +111,9 @@ class AnalysisResult:
     summary_df: pd.DataFrame
     review_df: pd.DataFrame
     preview_df: pd.DataFrame
+    source_df: pd.DataFrame
+    target_df: pd.DataFrame
+    grouped_reconciliation_df: pd.DataFrame
 
 
 class FlowEdge:
@@ -212,6 +222,10 @@ def score_candidate(
     full_name: str,
     external_name: str,
     max_external_chars: int,
+    match2_left: str = "",
+    match2_right: str = "",
+    match2_prefix_chars: int = 8,
+    match2_weight: float = 0.2,
     config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     full_tokens = token_set(full_name)
@@ -232,6 +246,16 @@ def score_candidate(
     score_prefix = float(fuzz.ratio(full_name[:max_external_chars], external_name[:max_external_chars]))
     score_ordered_chars = ordered_character_ratio(full_name, external_name)
     score_aligned_chars = aligned_character_ratio(full_name, external_name)
+    m2_left = str(match2_left or "").strip().upper()
+    m2_right = str(match2_right or "").strip().upper()
+    prefix_chars = max(int(match2_prefix_chars or 1), 1)
+    m2_prefix_left = m2_left[:prefix_chars]
+    m2_prefix_right = m2_right[:prefix_chars]
+    match2_equal_prefix = bool(m2_prefix_left and m2_prefix_right and m2_prefix_left == m2_prefix_right)
+    if m2_left or m2_right:
+        match2_score = ordered_character_ratio(m2_prefix_left, m2_prefix_right)
+    else:
+        match2_score = 0.0
 
     score = (
         weights["weight_token_set"] * score_token_set
@@ -258,6 +282,7 @@ def score_candidate(
         score -= float(config.get("missing_surname_penalty", 3.0) if config else 3.0)
 
     score = min(max(score, 0.0), 100.0)
+    score_composite = min(max(score + (match2_score * float(match2_weight)), 0.0), 100.0)
     structure_ok = same_first and (
         same_last
         or ext_subset_in_full
@@ -274,6 +299,7 @@ def score_candidate(
 
     return {
         "score": round(score, 2),
+        "score_composite": round(score_composite, 2),
         "same_first": same_first,
         "same_last": same_last,
         "ext_subset_in_full": ext_subset_in_full,
@@ -289,6 +315,12 @@ def score_candidate(
         "name_length_gap": length_gap,
         "needs_length_review": needs_length_review,
         "structure_ok": structure_ok,
+        "match2_left": m2_left,
+        "match2_right": m2_right,
+        "match2_prefix_left": m2_prefix_left,
+        "match2_prefix_right": m2_prefix_right,
+        "match2_equal_prefix": match2_equal_prefix,
+        "match2_score": round(match2_score, 2),
     }
 
 
@@ -328,71 +360,102 @@ def _find_header_index(ws, header_name: str) -> int | None:
     return None
 
 
-def format_output_workbook(output_file: Path) -> None:
+def format_output_workbook(output_file: Path, result: AnalysisResult, results_startrow: int) -> None:
     wb = load_workbook(output_file)
 
     header_fill = PatternFill("solid", fgColor="1F4E78")
     header_font = Font(color="FFFFFF", bold=True)
-    fill_green_160 = PatternFill("solid", fgColor="A9D18E")
-    fill_green_220 = PatternFill("solid", fgColor="E2F0D9")
-    fill_blue_170 = PatternFill("solid", fgColor="9DC3E6")
-    fill_red_200 = PatternFill("solid", fgColor="F4CCCC")
     fill_summary = PatternFill("solid", fgColor="D9EAF7")
     fill_conflict = PatternFill("solid", fgColor="FCE5CD")
+    fills = {
+        "EXACT": PatternFill("solid", fgColor=normalize_fill_color(result.config.get("color_exact"), DEFAULT_MATCH_COLORS["color_exact"])),
+        "MATCH": PatternFill("solid", fgColor=normalize_fill_color(result.config.get("color_match"), DEFAULT_MATCH_COLORS["color_match"])),
+        "REVIEW": PatternFill("solid", fgColor=normalize_fill_color(result.config.get("color_review"), DEFAULT_MATCH_COLORS["color_review"])),
+        "NO_MATCH": PatternFill("solid", fgColor=normalize_fill_color(result.config.get("color_no_match"), DEFAULT_MATCH_COLORS["color_no_match"])),
+        "EXCESS_LEFT": PatternFill("solid", fgColor=normalize_fill_color(result.config.get("color_excess_left"), DEFAULT_MATCH_COLORS["color_excess_left"])),
+    }
+
+    source_bucket_by_row = result.results_df.set_index("source_row_id")["final_color_bucket"].fillna("").to_dict()
+    target_row_map = result.target_df.set_index("excel_row_t2")["target_row_id"].to_dict() if not result.target_df.empty else {}
+    target_bucket_by_row_id: dict[int, str] = {
+        int(row_id): "NO_MATCH" for row_id in result.target_df["target_row_id"].tolist()
+    } if not result.target_df.empty else {}
+    priority = {"EXACT": 5, "MATCH": 4, "REVIEW": 3, "EXCESS_LEFT": 2, "NO_MATCH": 1, "": 0}
+    for row in result.results_df.itertuples(index=False):
+        line_match = getattr(row, "final_line_match_t2", pd.NA)
+        if pd.isna(line_match):
+            continue
+        target_row_id = target_row_map.get(int(line_match))
+        if target_row_id is None:
+            continue
+        bucket = str(getattr(row, "final_color_bucket", "") or "")
+        current = target_bucket_by_row_id.get(int(target_row_id), "")
+        if priority.get(bucket, 0) >= priority.get(current, 0):
+            target_bucket_by_row_id[int(target_row_id)] = bucket
 
     for ws in wb.worksheets:
-        ws.freeze_panes = "A2"
-        ws.auto_filter.ref = ws.dimensions
-
-        for cell in ws[1]:
-            cell.fill = header_fill
-            cell.font = header_font
-
-        _autosize_columns(ws)
-
-        if ws.title == "resumo":
-            for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+        if ws.title == "resultados_match":
+            summary_header_row = 1
+            data_header_row = results_startrow + 1
+            for cell in ws[summary_header_row]:
+                cell.fill = header_fill
+                cell.font = header_font
+            for row in ws.iter_rows(min_row=2, max_row=results_startrow):
                 for cell in row:
-                    cell.fill = fill_summary
-            continue
-        if ws.title == "t2_nao_utilizados":
-            for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
-                for cell in row:
-                    cell.fill = fill_red_200
-            continue
-
-        status_col = _find_header_index(ws, "final_status")
-        conflict_col = _find_header_index(ws, "final_conflict_flags")
-        color_bucket_col = _find_header_index(ws, "final_color_bucket")
-
-        for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
-            fill = None
-            color_bucket = str(row[color_bucket_col - 1].value or "").strip().upper() if color_bucket_col is not None else ""
-            if color_bucket == "GREEN_160":
-                fill = fill_green_160
-            elif color_bucket == "GREEN_220":
-                fill = fill_green_220
-            elif color_bucket == "BLUE_170":
-                fill = fill_blue_170
-            elif color_bucket == "RED_200":
-                fill = fill_red_200
-            elif status_col is not None:
-                status = str(row[status_col - 1].value or "").strip().upper()
-                if status == "ACEITO":
-                    fill = fill_green_220
-                elif status == "REVISAR":
-                    fill = fill_blue_170
-                elif status == "SEM_MATCH":
-                    fill = fill_red_200
-
-            if fill:
-                for cell in row:
-                    cell.fill = fill
-
+                    if cell.value not in (None, ""):
+                        cell.fill = fill_summary
+            for cell in ws[data_header_row]:
+                cell.fill = header_fill
+                cell.font = header_font
+            ws.freeze_panes = f"A{data_header_row + 1}"
+            for excel_row, bucket in enumerate(result.results_df["final_color_bucket"].fillna("").tolist(), start=data_header_row + 1):
+                fill = fills.get(str(bucket), None)
+                if fill is not None:
+                    for cell in ws[excel_row]:
+                        cell.fill = fill
+            conflict_col = _find_header_index(ws, "final_conflict_flags")
             if conflict_col is not None:
-                conflict_value = str(row[conflict_col - 1].value or "").strip()
-                if conflict_value:
-                    row[conflict_col - 1].fill = fill_conflict
+                for row in ws.iter_rows(min_row=data_header_row + 1, max_row=ws.max_row):
+                    value = str(row[conflict_col - 1].value or "").strip()
+                    if value:
+                        row[conflict_col - 1].fill = fill_conflict
+        elif ws.title == "excel_1_original":
+            for cell in ws[1]:
+                cell.fill = header_fill
+                cell.font = header_font
+            ws.freeze_panes = "A2"
+            for source_row_id, bucket in source_bucket_by_row.items():
+                fill = fills.get(str(bucket), None)
+                if fill is None:
+                    continue
+                excel_row = int(source_row_id) + 1
+                for cell in ws[excel_row]:
+                    cell.fill = fill
+        elif ws.title == "excel_2_original":
+            for cell in ws[1]:
+                cell.fill = header_fill
+                cell.font = header_font
+            ws.freeze_panes = "A2"
+            for target_row_id, bucket in target_bucket_by_row_id.items():
+                fill = fills.get(str(bucket), None)
+                if fill is None:
+                    continue
+                excel_row = int(target_row_id) + 1
+                for cell in ws[excel_row]:
+                    cell.fill = fill
+        elif ws.title == "conciliacao_quantidades":
+            for cell in ws[1]:
+                cell.fill = header_fill
+                cell.font = header_font
+            ws.freeze_panes = "A2"
+            reconciliation_df = result.grouped_reconciliation_df
+            for row_number, row in enumerate(reconciliation_df.to_dict("records"), start=2):
+                if row.get("_bucket_left"):
+                    ws.cell(row=row_number, column=1).fill = fills.get(str(row["_bucket_left"]), PatternFill())
+                if row.get("_bucket_right"):
+                    ws.cell(row=row_number, column=2).fill = fills.get(str(row["_bucket_right"]), PatternFill())
+        ws.auto_filter.ref = ws.dimensions
+        _autosize_columns(ws)
 
     wb.save(output_file)
 
@@ -407,22 +470,78 @@ def open_file_with_default_app(path: Path) -> None:
         subprocess.Popen(["xdg-open", str(path)])
 
 
+def list_workbook_sheets(file_path: str | Path) -> list[str]:
+    path = Path(file_path)
+    if not path.exists():
+        return []
+    try:
+        return list(pd.ExcelFile(path).sheet_names)
+    except Exception:
+        return []
+
+
+def normalize_fill_color(value: Any, default: str) -> str:
+    text = str(value or "").strip().replace("#", "").upper()
+    if len(text) == 6:
+        return f"FF{text}"
+    if len(text) == 8:
+        return text
+    return default
+
+
+def parse_csv_columns(value: Any) -> list[str]:
+    text = str(value or "").strip()
+    if not text:
+        return []
+    return [part.strip() for part in text.split(",") if part.strip()]
+
+
+def serialize_csv_columns(columns: list[str]) -> str:
+    return ", ".join([str(column).strip() for column in columns if str(column).strip()])
+
+
+def list_workbook_columns(
+    file_path: str | Path,
+    sheet_name: str,
+    header_row: int,
+) -> list[str]:
+    path = Path(file_path)
+    if not path.exists():
+        return []
+    try:
+        preview_df = pd.read_excel(
+            path,
+            sheet_name=sheet_name,
+            header=max(int(header_row) - 1, 0),
+            dtype=str,
+            nrows=0,
+        )
+        return [str(col) for col in preview_df.columns]
+    except Exception:
+        return []
+
+
 def collect_workbook_preview(config: dict[str, Any]) -> str:
-    input_file = Path(config["input_file"])
-    if not input_file.exists():
-        raise FileNotFoundError(f"Arquivo de entrada não encontrado: {input_file}")
-
-    xls = pd.ExcelFile(input_file)
-    lines = [f"Arquivo: {input_file}", f"Abas: {', '.join(xls.sheet_names)}", ""]
-
-    for label, sheet_key, header_key, col_key in (
-        ("Tabela 1", "sheet_t1", "header_row_t1", "name_col_t1"),
-        ("Tabela 2", "sheet_t2", "header_row_t2", "name_col_t2"),
+    lines: list[str] = []
+    for label, file_key, sheet_key, header_key, col_key, match2_key in (
+        ("Excel 1", "input_file_t1", "sheet_t1", "header_row_t1", "name_col_t1", "match2_col_t1"),
+        ("Excel 2", "input_file_t2", "sheet_t2", "header_row_t2", "name_col_t2", "match2_col_t2"),
     ):
+        input_file = Path(config[file_key])
+        if not input_file.exists():
+            raise FileNotFoundError(f"Arquivo de entrada não encontrado: {input_file}")
+
+        xls = pd.ExcelFile(input_file)
+        lines.extend(
+            [
+                f"{label}: {input_file}",
+                f"  - Quantidade de abas: {len(xls.sheet_names)}",
+                f"  - Abas: {', '.join(xls.sheet_names)}",
+            ]
+        )
         sheet_name = config[sheet_key]
         header_row = int(config[header_key])
         name_col = config[col_key]
-        lines.append(f"{label}:")
         if sheet_name not in xls.sheet_names:
             lines.append(f"  - Aba ausente: {sheet_name}")
             lines.append("")
@@ -436,6 +555,7 @@ def collect_workbook_preview(config: dict[str, Any]) -> str:
             nrows=5,
         )
         headers = [str(col) for col in preview_df.columns]
+        lines.append(f"  - Aba ativa: {sheet_name}")
         lines.append(f"  - Linha de cabeçalho: {header_row}")
         lines.append(f"  - Colunas: {', '.join(headers[:15])}")
         selected_index = excel_col_to_index(name_col)
@@ -445,22 +565,42 @@ def collect_workbook_preview(config: dict[str, Any]) -> str:
             lines.append(f"  - Coluna de nome {name_col} -> {headers[selected_index]}")
             sample_values = preview_df.iloc[:, selected_index].fillna("").astype(str).head(5).tolist()
             lines.append(f"  - Valores de exemplo: {sample_values}")
+        match2_col = str(config.get(match2_key, "") or "").strip()
+        if match2_col:
+            match2_index = excel_col_to_index(match2_col)
+            if match2_index >= len(headers):
+                lines.append(f"  - Coluna match 2 {match2_col} fora do intervalo")
+            else:
+                lines.append(f"  - Coluna match 2 {match2_col} -> {headers[match2_index]}")
+                sample_match2 = preview_df.iloc[:, match2_index].fillna("").astype(str).head(5).tolist()
+                lines.append(f"  - Match 2 (amostra): {sample_match2}")
         lines.append("")
+    lines.append(
+        f"Match 2: prefixo={config.get('match2_prefix_chars', 8)} chars, peso auxiliar={config.get('match2_weight', 0.2)}"
+    )
+    lines.append(f"Match 1: limite efetivo de caracteres = {config.get('max_external_chars', 30)}")
+    lines.append(
+        f"Extras aba 4 E1: {config.get('tab4_extra_cols_t1', '') or '(nenhum)'} | E2: {config.get('tab4_extra_cols_t2', '') or '(nenhum)'}"
+    )
     return "\n".join(lines).strip()
 
 
 def validate_config(config: dict[str, Any], validate_workbook: bool = True) -> dict[str, Any]:
     normalized = dict(config)
-    normalized["input_file"] = str(Path(normalized["input_file"]).expanduser())
+    normalized["input_file_t1"] = str(Path(normalized["input_file_t1"]).expanduser())
+    normalized["input_file_t2"] = str(Path(normalized["input_file_t2"]).expanduser())
     normalized["output_file"] = str(Path(normalized["output_file"]).expanduser())
 
     required_text = [
-        "input_file",
+        "input_file_t1",
+        "input_file_t2",
         "output_file",
         "sheet_t1",
         "sheet_t2",
         "name_col_t1",
         "name_col_t2",
+        "output_mode",
+        "quantity_resolution_mode",
     ]
     for key in required_text:
         if not str(normalized.get(key, "")).strip():
@@ -477,10 +617,18 @@ def validate_config(config: dict[str, Any], validate_workbook: bool = True) -> d
     normalized["length_gap_penalty_per_char"] = float(normalized.get("length_gap_penalty_per_char", 0.5))
     normalized["max_length_gap_penalty"] = float(normalized.get("max_length_gap_penalty", 10.0))
     normalized["missing_surname_penalty"] = float(normalized.get("missing_surname_penalty", 3.0))
+    normalized["match2_prefix_chars"] = int(normalized.get("match2_prefix_chars", 8) or 8)
+    normalized["match2_weight"] = float(normalized.get("match2_weight", 0.2) or 0.2)
     normalized["allow_reuse_t2_matches"] = bool(normalized["allow_reuse_t2_matches"])
     normalized["auto_open_output"] = bool(normalized["auto_open_output"])
+    normalized["match2_col_t1"] = str(normalized.get("match2_col_t1", "") or "").strip().upper()
+    normalized["match2_col_t2"] = str(normalized.get("match2_col_t2", "") or "").strip().upper()
+    normalized["tab4_extra_cols_t1"] = serialize_csv_columns(parse_csv_columns(normalized.get("tab4_extra_cols_t1", "")))
+    normalized["tab4_extra_cols_t2"] = serialize_csv_columns(parse_csv_columns(normalized.get("tab4_extra_cols_t2", "")))
     for key, default_value in DEFAULT_SCORE_WEIGHTS.items():
         normalized[key] = float(normalized.get(key, default_value))
+    for key, default_value in DEFAULT_MATCH_COLORS.items():
+        normalized[key] = normalize_fill_color(normalized.get(key), default_value)
 
     if normalized["header_row_t1"] <= 0 or normalized["header_row_t2"] <= 0:
         raise ValueError("As linhas de cabeçalho devem ser maiores que zero.")
@@ -500,35 +648,65 @@ def validate_config(config: dict[str, Any], validate_workbook: bool = True) -> d
         raise ValueError("A penalidade máxima por diferença de tamanho deve ser zero ou maior.")
     if normalized["missing_surname_penalty"] < 0:
         raise ValueError("A penalidade por sobrenome ausente deve ser zero ou maior.")
+    if normalized["match2_prefix_chars"] <= 0:
+        raise ValueError("A quantidade de caracteres do match 2 deve ser maior que zero.")
+    if normalized["match2_weight"] < 0:
+        raise ValueError("O peso do match 2 deve ser zero ou maior.")
     if all(normalized[key] <= 0 for key in DEFAULT_SCORE_WEIGHTS):
         raise ValueError("Pelo menos um peso de pontuação deve ser maior que zero.")
+    if bool(normalized["match2_col_t1"]) != bool(normalized["match2_col_t2"]):
+        raise ValueError("Para usar match 2, configure a coluna em ambos os excels.")
 
     excel_col_to_index(normalized["name_col_t1"])
     excel_col_to_index(normalized["name_col_t2"])
+    if normalized["match2_col_t1"]:
+        excel_col_to_index(normalized["match2_col_t1"])
+    if normalized["match2_col_t2"]:
+        excel_col_to_index(normalized["match2_col_t2"])
 
-    input_file = Path(normalized["input_file"])
     if validate_workbook:
-        if not input_file.exists():
-            raise FileNotFoundError(f"Arquivo de entrada não encontrado: {input_file}")
-        xls = pd.ExcelFile(input_file)
-        missing = [sheet for sheet in (normalized["sheet_t1"], normalized["sheet_t2"]) if sheet not in xls.sheet_names]
-        if missing:
-            raise ValueError(f"Aba(s) ausente(s): {', '.join(missing)}")
+        file_t1 = Path(normalized["input_file_t1"])
+        file_t2 = Path(normalized["input_file_t2"])
+        if not file_t1.exists():
+            raise FileNotFoundError(f"Arquivo de entrada não encontrado: {file_t1}")
+        if not file_t2.exists():
+            raise FileNotFoundError(f"Arquivo de entrada não encontrado: {file_t2}")
+        sheets_t1 = pd.ExcelFile(file_t1).sheet_names
+        sheets_t2 = pd.ExcelFile(file_t2).sheet_names
+        if normalized["sheet_t1"] not in sheets_t1:
+            raise ValueError(f"Aba ausente no Excel 1: {normalized['sheet_t1']}")
+        if normalized["sheet_t2"] not in sheets_t2:
+            raise ValueError(f"Aba ausente no Excel 2: {normalized['sheet_t2']}")
+        headers_t1 = list_workbook_columns(file_t1, normalized["sheet_t1"], normalized["header_row_t1"])
+        headers_t2 = list_workbook_columns(file_t2, normalized["sheet_t2"], normalized["header_row_t2"])
+        if normalized["match2_col_t1"] and excel_col_to_index(normalized["match2_col_t1"]) >= len(headers_t1):
+            raise ValueError(f"Coluna match 2 inválida no Excel 1: {normalized['match2_col_t1']}")
+        if normalized["match2_col_t2"] and excel_col_to_index(normalized["match2_col_t2"]) >= len(headers_t2):
+            raise ValueError(f"Coluna match 2 inválida no Excel 2: {normalized['match2_col_t2']}")
+        extras_t1 = parse_csv_columns(normalized["tab4_extra_cols_t1"])
+        extras_t2 = parse_csv_columns(normalized["tab4_extra_cols_t2"])
+        missing_t1 = [col for col in extras_t1 if col not in headers_t1]
+        missing_t2 = [col for col in extras_t2 if col not in headers_t2]
+        if missing_t1:
+            raise ValueError(f"Coluna(s) extra(s) da aba 4 ausente(s) no Excel 1: {', '.join(missing_t1)}")
+        if missing_t2:
+            raise ValueError(f"Coluna(s) extra(s) da aba 4 ausente(s) no Excel 2: {', '.join(missing_t2)}")
 
     return normalized
 
 
 def prepare_input_frames(config: dict[str, Any], progress_callback: ProgressCallback | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
-    input_file = Path(config["input_file"])
-    emit_progress(progress_callback, "Lendo abas da planilha...", 5)
+    input_file_t1 = Path(config["input_file_t1"])
+    input_file_t2 = Path(config["input_file_t2"])
+    emit_progress(progress_callback, "Lendo abas das planilhas...", 5)
     df1 = pd.read_excel(
-        input_file,
+        input_file_t1,
         sheet_name=config["sheet_t1"],
         header=config["header_row_t1"] - 1,
         dtype=str,
     )
     df2 = pd.read_excel(
-        input_file,
+        input_file_t2,
         sheet_name=config["sheet_t2"],
         header=config["header_row_t2"] - 1,
         dtype=str,
@@ -536,10 +714,16 @@ def prepare_input_frames(config: dict[str, Any], progress_callback: ProgressCall
 
     idx_t1 = excel_col_to_index(config["name_col_t1"])
     idx_t2 = excel_col_to_index(config["name_col_t2"])
+    idx_match2_t1 = excel_col_to_index(config["match2_col_t1"]) if config.get("match2_col_t1") else None
+    idx_match2_t2 = excel_col_to_index(config["match2_col_t2"]) if config.get("match2_col_t2") else None
     if idx_t1 >= len(df1.columns):
         raise IndexError(f"A coluna {config['name_col_t1']} não existe em {config['sheet_t1']}.")
     if idx_t2 >= len(df2.columns):
         raise IndexError(f"A coluna {config['name_col_t2']} não existe em {config['sheet_t2']}.")
+    if idx_match2_t1 is not None and idx_match2_t1 >= len(df1.columns):
+        raise IndexError(f"A coluna match 2 {config['match2_col_t1']} não existe em {config['sheet_t1']}.")
+    if idx_match2_t2 is not None and idx_match2_t2 >= len(df2.columns):
+        raise IndexError(f"A coluna match 2 {config['match2_col_t2']} não existe em {config['sheet_t2']}.")
 
     emit_progress(progress_callback, "Normalizando nomes e metadados...", 12)
     df1 = df1.copy()
@@ -552,35 +736,56 @@ def prepare_input_frames(config: dict[str, Any], progress_callback: ProgressCall
 
     df1["nome_t1_original"] = df1.iloc[:, idx_t1].fillna("").astype(str)
     df2["nome_t2_original"] = df2.iloc[:, idx_t2].fillna("").astype(str)
+    if idx_match2_t1 is not None:
+        df1["match2_t1_original"] = df1.iloc[:, idx_match2_t1].fillna("").astype(str)
+    else:
+        df1["match2_t1_original"] = ""
+    if idx_match2_t2 is not None:
+        df2["match2_t2_original"] = df2.iloc[:, idx_match2_t2].fillna("").astype(str)
+    else:
+        df2["match2_t2_original"] = ""
     df1["nome_t1_norm"] = df1["nome_t1_original"].apply(normalize_name)
     df2["nome_t2_norm"] = df2["nome_t2_original"].apply(normalize_name)
-    df1["first_token"] = df1["nome_t1_norm"].apply(first_token)
-    df1["last_token"] = df1["nome_t1_norm"].apply(last_token)
-    df2["first_token"] = df2["nome_t2_norm"].apply(first_token)
-    df2["last_token"] = df2["nome_t2_norm"].apply(last_token)
-    df1["key_prefix"] = df1["nome_t1_norm"].str[: config["max_external_chars"]]
-    df2["key_prefix"] = df2["nome_t2_norm"].str[: config["max_external_chars"]]
+    limit_chars = int(config["max_external_chars"])
+    df1["nome_t1_match_norm"] = df1["nome_t1_norm"].str[:limit_chars]
+    df2["nome_t2_match_norm"] = df2["nome_t2_norm"].str[:limit_chars]
+    df1["match2_t1_norm"] = df1["match2_t1_original"].fillna("").astype(str).str.strip().str.upper()
+    df2["match2_t2_norm"] = df2["match2_t2_original"].fillna("").astype(str).str.strip().str.upper()
+    prefix_chars = int(config.get("match2_prefix_chars", 8))
+    df1["match2_t1_prefix"] = df1["match2_t1_norm"].str[:prefix_chars]
+    df2["match2_t2_prefix"] = df2["match2_t2_norm"].str[:prefix_chars]
+    df1["first_token"] = df1["nome_t1_match_norm"].apply(first_token)
+    df1["last_token"] = df1["nome_t1_match_norm"].apply(last_token)
+    df2["first_token"] = df2["nome_t2_match_norm"].apply(first_token)
+    df2["last_token"] = df2["nome_t2_match_norm"].apply(last_token)
+    df1["key_prefix"] = df1["nome_t1_match_norm"]
+    df2["key_prefix"] = df2["nome_t2_match_norm"]
 
     return df1, df2
 
 
 def build_target_catalog(df2: pd.DataFrame, config: dict[str, Any]) -> tuple[pd.DataFrame, dict[str, list[dict[str, Any]]]]:
-    df2_valid = df2[df2["nome_t2_norm"] != ""].copy()
+    df2_valid = df2[df2["nome_t2_match_norm"] != ""].copy()
     if df2_valid.empty:
         return pd.DataFrame(), {"by_prefix": defaultdict(list), "by_first": defaultdict(list), "by_last": defaultdict(list), "all": []}
 
     grouped = (
         df2_valid.sort_values("excel_row_t2")
-        .groupby("nome_t2_norm", as_index=False)
+        .groupby("nome_t2_match_norm", as_index=False)
         .agg(
+            nome_t2_norm_full=("nome_t2_norm", "first"),
             nome_t2_original=("nome_t2_original", "first"),
             excel_row_t2=("excel_row_t2", "min"),
             first_token=("first_token", "first"),
             last_token=("last_token", "first"),
             key_prefix=("key_prefix", "first"),
-            quota_original=("nome_t2_norm", "size"),
+            match2_t2_original=("match2_t2_original", "first"),
+            match2_t2_norm=("match2_t2_norm", "first"),
+            match2_t2_prefix=("match2_t2_prefix", "first"),
+            quota_original=("nome_t2_match_norm", "size"),
         )
     )
+    grouped = grouped.rename(columns={"nome_t2_match_norm": "nome_t2_norm"})
     if config["allow_reuse_t2_matches"]:
         grouped["quota_limit"] = grouped["quota_original"].apply(lambda count: max(int(count), config["max_matches_per_t2_name"]))
     else:
@@ -635,7 +840,7 @@ def choose_candidate_pool(
 
 
 def candidate_utility(candidate: dict[str, Any]) -> int:
-    utility = int(round(candidate["score"] * 100))
+    utility = int(round(candidate.get("score_composite", candidate["score"]) * 100))
     if candidate["exact_norm"]:
         utility += 5000
     if candidate["exact_prefix"]:
@@ -760,9 +965,14 @@ def initialize_result_columns(results_df: pd.DataFrame, top_candidates_to_keep: 
         "analysis_match_t2_norm": "",
         "analysis_line_match_t2": pd.NA,
         "analysis_score": pd.NA,
+        "analysis_score_composite": pd.NA,
         "analysis_score_gap": pd.NA,
         "analysis_conflict_flags": "",
         "analysis_review_reason": "",
+        "analysis_match2_t1": "",
+        "analysis_match2_t2": "",
+        "analysis_match2_equal_prefix": False,
+        "analysis_match2_score": pd.NA,
         "manual_status": "",
         "manual_match_t2_original": "",
         "manual_match_t2_norm": "",
@@ -774,8 +984,11 @@ def initialize_result_columns(results_df: pd.DataFrame, top_candidates_to_keep: 
         "final_method": "",
         "final_match_t2_original": "",
         "final_match_t2_norm": "",
+        "final_group_t2_original": "",
+        "final_group_t2_norm": "",
         "final_line_match_t2": pd.NA,
         "final_score": pd.NA,
+        "final_score_composite": pd.NA,
         "final_score_gap": pd.NA,
         "final_score_ordered_chars": pd.NA,
         "final_score_aligned_chars": pd.NA,
@@ -784,6 +997,10 @@ def initialize_result_columns(results_df: pd.DataFrame, top_candidates_to_keep: 
         "final_color_bucket": "",
         "final_conflict_flags": "",
         "final_review_required": False,
+        "final_match2_t1": "",
+        "final_match2_t2": "",
+        "final_match2_equal_prefix": False,
+        "final_match2_score": pd.NA,
         "final_quota_limit": pd.NA,
         "final_quota_order": pd.NA,
         "final_within_quota": pd.NA,
@@ -816,6 +1033,9 @@ def analyze_matching(config: dict[str, Any], progress_callback: ProgressCallback
             summary_df=summary_df,
             review_df=results_df[results_df["final_status"] == "REVISAR"].copy(),
             preview_df=results_df.head(30).copy(),
+            source_df=df1.copy(),
+            target_df=df2.copy(),
+            grouped_reconciliation_df=pd.DataFrame(),
         )
 
     candidate_rows: list[dict[str, Any]] = []
@@ -830,7 +1050,7 @@ def analyze_matching(config: dict[str, Any], progress_callback: ProgressCallback
 
         row = results_df.loc[row_index]
         source_row_id = int(row["source_row_id"])
-        name_norm = row["nome_t1_norm"]
+        name_norm = row["nome_t1_match_norm"]
         if not name_norm:
             results_df.at[row_index, "analysis_status"] = "SEM_MATCH"
             results_df.at[row_index, "analysis_method"] = "SEM_DADO"
@@ -850,6 +1070,10 @@ def analyze_matching(config: dict[str, Any], progress_callback: ProgressCallback
                 name_norm,
                 str(record["nome_t2_norm"]),
                 config["max_external_chars"],
+                match2_left=str(row.get("match2_t1_norm", "") or ""),
+                match2_right=str(record.get("match2_t2_norm", "") or ""),
+                match2_prefix_chars=int(config.get("match2_prefix_chars", 8)),
+                match2_weight=float(config.get("match2_weight", 0.2)),
                 config=config,
             )
             exact_norm = name_norm == record["nome_t2_norm"]
@@ -860,8 +1084,14 @@ def analyze_matching(config: dict[str, Any], progress_callback: ProgressCallback
                     "excel_row_t1": row["excel_row_t1"],
                     "nome_t1_original": row["nome_t1_original"],
                     "nome_t1_norm": name_norm,
+                    "nome_t1_norm_full": row["nome_t1_norm"],
+                    "match2_t1_original": row.get("match2_t1_original", ""),
+                    "match2_t1_norm": row.get("match2_t1_norm", ""),
                     "nome_t2_original": record["nome_t2_original"],
                     "nome_t2_norm": record["nome_t2_norm"],
+                    "nome_t2_norm_full": record.get("nome_t2_norm_full", record["nome_t2_norm"]),
+                    "match2_t2_original": record.get("match2_t2_original", ""),
+                    "match2_t2_norm": record.get("match2_t2_norm", ""),
                     "excel_row_t2": record["excel_row_t2"],
                     "quota_original": record["quota_original"],
                     "quota_limit": record["quota_limit"],
@@ -873,6 +1103,7 @@ def analyze_matching(config: dict[str, Any], progress_callback: ProgressCallback
 
         scored.sort(
             key=lambda item: (
+                item["score_composite"],
                 item["score"],
                 item["exact_norm"],
                 item["exact_prefix"],
@@ -886,14 +1117,15 @@ def analyze_matching(config: dict[str, Any], progress_callback: ProgressCallback
         kept = scored[:internal_keep]
         for rank, candidate in enumerate(kept, start=1):
             next_score = kept[rank]["score"] if rank < len(kept) else 0.0
-            gap_to_next = round(candidate["score"] - next_score, 2)
+            next_composite = kept[rank]["score_composite"] if rank < len(kept) else 0.0
+            gap_to_next = round(candidate["score_composite"] - next_composite, 2)
             candidate["rank"] = rank
             candidate["gap_to_next"] = gap_to_next
-            candidate["review_eligible"] = bool(candidate["score"] >= config["review_score"] and candidate["same_first"])
+            candidate["review_eligible"] = bool(candidate["score_composite"] >= config["review_score"] and candidate["same_first"])
             candidate["eligible_for_global"] = bool(
                 candidate["exact_norm"]
                 or candidate["exact_prefix"]
-                or (candidate["score"] >= config["accept_score"] and candidate["structure_ok"])
+                or (candidate["score_composite"] >= config["accept_score"] and candidate["structure_ok"])
             )
             candidate["confident_if_top"] = bool(
                 rank == 1
@@ -901,7 +1133,7 @@ def analyze_matching(config: dict[str, Any], progress_callback: ProgressCallback
                     candidate["exact_norm"]
                     or candidate["exact_prefix"]
                     or (
-                        candidate["score"] >= config["accept_score"]
+                        candidate["score_composite"] >= config["accept_score"]
                         and candidate["structure_ok"]
                         and gap_to_next >= config["min_gap_for_accept"]
                     )
@@ -913,7 +1145,7 @@ def analyze_matching(config: dict[str, Any], progress_callback: ProgressCallback
 
             if rank <= config["top_candidates_to_keep"]:
                 results_df.at[row_index, f"cand_{rank}_nome"] = candidate["nome_t2_original"]
-                results_df.at[row_index, f"cand_{rank}_score"] = candidate["score"]
+                results_df.at[row_index, f"cand_{rank}_score"] = candidate["score_composite"]
 
     candidates_df = pd.DataFrame(candidate_rows)
     emit_progress(progress_callback, "Executando alocação global com controle de cotas...", 62)
@@ -961,7 +1193,7 @@ def analyze_matching(config: dict[str, Any], progress_callback: ProgressCallback
                 results_df.at[row_index, "analysis_review_reason"] = "Nenhum candidato foi gerado."
             else:
                 add_flag(flags, "LOW_GAP", best["gap_to_next"] < config["min_gap_for_accept"] and not (best["exact_norm"] or best["exact_prefix"]))
-                add_flag(flags, "STRUCTURE_WARNING", best["score"] >= config["accept_score"] and not best["structure_ok"])
+                add_flag(flags, "STRUCTURE_WARNING", best["score_composite"] >= config["accept_score"] and not best["structure_ok"])
                 add_flag(flags, "QUOTA_CONFLICT", bool(eligible_counts.get(source_row_id)) and assigned is None)
                 add_flag(flags, "GLOBAL_REALLOCATED", assigned is not None and int(assigned["rank"]) > 1)
                 add_flag(flags, "LENGTH_POSITION_REVIEW", bool(best.get("needs_length_review", False)))
@@ -971,7 +1203,12 @@ def analyze_matching(config: dict[str, Any], progress_callback: ProgressCallback
                 results_df.at[row_index, "analysis_match_t2_norm"] = chosen["nome_t2_norm"]
                 results_df.at[row_index, "analysis_line_match_t2"] = chosen["excel_row_t2"]
                 results_df.at[row_index, "analysis_score"] = chosen["score"]
+                results_df.at[row_index, "analysis_score_composite"] = chosen["score_composite"]
                 results_df.at[row_index, "analysis_score_gap"] = chosen["gap_to_next"]
+                results_df.at[row_index, "analysis_match2_t1"] = str(results_df.at[row_index, "match2_t1_original"] or "")
+                results_df.at[row_index, "analysis_match2_t2"] = chosen.get("match2_t2_original", "")
+                results_df.at[row_index, "analysis_match2_equal_prefix"] = bool(chosen.get("match2_equal_prefix", False))
+                results_df.at[row_index, "analysis_match2_score"] = chosen.get("match2_score", pd.NA)
 
                 if assigned is not None and int(assigned["rank"]) == 1 and bool(assigned["confident_if_top"]):
                     results_df.at[row_index, "analysis_status"] = "ACEITO"
@@ -1033,6 +1270,9 @@ def analyze_matching(config: dict[str, Any], progress_callback: ProgressCallback
         summary_df=summary_df,
         review_df=review_df,
         preview_df=preview_df,
+        source_df=df1.copy(),
+        target_df=df2.copy(),
+        grouped_reconciliation_df=pd.DataFrame(),
     )
 
 
@@ -1061,20 +1301,35 @@ def determine_color_bucket(
     ordered_score: float,
     aligned_score: float,
     same_name_length: bool,
+    final_method: str = "",
+    source_norm: str = "",
+    final_norm: str = "",
+    match2_equal_prefix: bool = False,
+    match2_active: bool = False,
+    match2_values_present: bool = False,
     config: dict[str, Any] | None = None,
 ) -> str:
-    score_value = safe_float(final_score) or 0.0
-    review_floor = float(config.get("review_score", 85.0)) if config else 85.0
-
+    if final_method == "EXCESS_LEFT":
+        return "EXCESS_LEFT"
     if final_status == "SEM_MATCH":
-        return "RED_200"
-    if score_value >= 99.5 and same_name_length and ordered_score >= 99.5 and aligned_score >= 99.5:
-        return "GREEN_160"
-    if score_value >= 99.5:
-        return "GREEN_220"
-    if review_floor <= score_value < 99.5:
-        return "BLUE_170"
-    return ""
+        return "NO_MATCH"
+    if final_status == "REVISAR":
+        return "REVIEW"
+    if final_status == "ACEITO":
+        is_exact_name = bool(
+            source_norm
+            and final_norm
+            and source_norm == final_norm
+            and same_name_length
+            and ordered_score >= 99.5
+            and aligned_score >= 99.5
+        )
+        if is_exact_name and match2_active and match2_values_present and not match2_equal_prefix:
+            return "MATCH"
+        if is_exact_name:
+            return "EXACT"
+        return "MATCH"
+    return "NO_MATCH"
 
 
 def recompute_final_state(
@@ -1105,9 +1360,14 @@ def recompute_final_state(
         analysis_match_norm = str(results_df.at[row_index, "analysis_match_t2_norm"] or "")
         analysis_match_original = str(results_df.at[row_index, "analysis_match_t2_original"] or "")
         analysis_score = results_df.at[row_index, "analysis_score"]
+        analysis_score_composite = results_df.at[row_index, "analysis_score_composite"]
         analysis_gap = results_df.at[row_index, "analysis_score_gap"]
         analysis_line = results_df.at[row_index, "analysis_line_match_t2"]
         analysis_flags = str(results_df.at[row_index, "analysis_conflict_flags"] or "")
+        analysis_match2_t1 = str(results_df.at[row_index, "analysis_match2_t1"] or "")
+        analysis_match2_t2 = str(results_df.at[row_index, "analysis_match2_t2"] or "")
+        analysis_match2_equal_prefix = bool(results_df.at[row_index, "analysis_match2_equal_prefix"])
+        analysis_match2_score = results_df.at[row_index, "analysis_match2_score"]
 
         manual_status = str(results_df.at[row_index, "manual_status"] or "").upper()
         manual_norm = str(results_df.at[row_index, "manual_match_t2_norm"] or "")
@@ -1122,6 +1382,7 @@ def recompute_final_state(
         final_original = analysis_match_original
         final_line = analysis_line
         final_score = analysis_score
+        final_score_composite = analysis_score_composite
         final_gap = analysis_gap
         final_flags = [flag for flag in analysis_flags.split("; ") if flag]
 
@@ -1132,6 +1393,7 @@ def recompute_final_state(
             final_original = manual_original or original_map.get(manual_norm, "")
             final_line = manual_line if pd.notna(manual_line) else line_map.get(manual_norm, pd.NA)
             final_score = manual_score if pd.notna(manual_score) else final_score
+            final_score_composite = manual_score if pd.notna(manual_score) else final_score_composite
             add_flag(final_flags, "MANUAL_OVERRIDE", True)
         elif manual_status == "NO_MATCH":
             final_status = "SEM_MATCH"
@@ -1140,6 +1402,7 @@ def recompute_final_state(
             final_original = ""
             final_line = pd.NA
             final_score = pd.NA
+            final_score_composite = pd.NA
             final_gap = pd.NA
             add_flag(final_flags, "MANUAL_OVERRIDE", True)
         elif manual_status == "REVIEW":
@@ -1159,10 +1422,15 @@ def recompute_final_state(
                 "final_match_t2_original": final_original,
                 "final_line_match_t2": final_line,
                 "final_score": final_score,
+                "final_score_composite": final_score_composite,
                 "final_score_gap": final_gap,
                 "final_flags": final_flags,
                 "manual_status": manual_status,
                 "manual_sequence": results_df.at[row_index, "manual_sequence"],
+                "final_match2_t1": analysis_match2_t1,
+                "final_match2_t2": analysis_match2_t2,
+                "final_match2_equal_prefix": analysis_match2_equal_prefix,
+                "final_match2_score": analysis_match2_score,
             }
         )
 
@@ -1189,10 +1457,14 @@ def recompute_final_state(
         final_status = row["final_status"]
         final_method = row["final_method"]
         final_norm = row["final_match_t2_norm"]
+        final_original = row["final_match_t2_original"]
         final_flags = row["final_flags"]
         quota_limit = quota_map.get(final_norm) if final_norm else None
         quota_order = pd.NA
         within_quota: Any = pd.NA
+        source_norm = str(results_df.at[row_index, "nome_t1_match_norm"] or results_df.at[row_index, "nome_t1_norm"] or "")
+        group_norm = final_norm
+        group_original = final_original
 
         if final_status == "ACEITO" and final_norm:
             matching_rows = accepted_df[accepted_df["row_index"] == row_index]
@@ -1204,22 +1476,44 @@ def recompute_final_state(
                 within_quota = False
 
             if row_index not in keep_rows:
-                final_status = "REVISAR"
-                final_method = "FINAL_QUOTA_CONFLICT"
-                add_flag(final_flags, "FINAL_QUOTA_CONFLICT", True)
+                if config and config.get("quantity_resolution_mode") == "marcar_excedente_excel1" and source_norm == final_norm:
+                    final_status = "SEM_MATCH"
+                    final_method = "EXCESS_LEFT"
+                    add_flag(final_flags, "EXCESS_LEFT", True)
+                else:
+                    final_status = "REVISAR"
+                    final_method = "FINAL_QUOTA_CONFLICT"
+                    add_flag(final_flags, "FINAL_QUOTA_CONFLICT", True)
+        elif (
+            config
+            and config.get("quantity_resolution_mode") == "marcar_excedente_excel1"
+            and final_status == "REVISAR"
+            and final_norm
+            and source_norm == final_norm
+            and final_method in {"QUOTA_CONFLICT", "FINAL_QUOTA_CONFLICT"}
+        ):
+            final_status = "SEM_MATCH"
+            final_method = "EXCESS_LEFT"
+            add_flag(final_flags, "EXCESS_LEFT", True)
 
         results_df.at[row_index, "final_status"] = final_status
         results_df.at[row_index, "final_method"] = final_method
+        results_df.at[row_index, "final_group_t2_norm"] = group_norm if group_norm else ""
+        results_df.at[row_index, "final_group_t2_original"] = group_original if group_original else ""
         results_df.at[row_index, "final_match_t2_norm"] = row["final_match_t2_norm"] if final_status == "ACEITO" else (
             row["final_match_t2_norm"] if final_status == "REVISAR" else ""
         )
         results_df.at[row_index, "final_match_t2_original"] = row["final_match_t2_original"] if final_status != "SEM_MATCH" else ""
         results_df.at[row_index, "final_line_match_t2"] = row["final_line_match_t2"] if final_status != "SEM_MATCH" else pd.NA
         results_df.at[row_index, "final_score"] = row["final_score"] if final_status != "SEM_MATCH" else pd.NA
+        results_df.at[row_index, "final_score_composite"] = row["final_score_composite"] if final_status != "SEM_MATCH" else pd.NA
         results_df.at[row_index, "final_score_gap"] = row["final_score_gap"] if final_status != "SEM_MATCH" else pd.NA
-        source_norm = str(results_df.at[row_index, "nome_t1_norm"] or "")
-        final_norm_for_metrics = str(results_df.at[row_index, "final_match_t2_norm"] or "")
-        if final_status != "SEM_MATCH" and final_norm_for_metrics:
+        results_df.at[row_index, "final_match2_t1"] = row.get("final_match2_t1", "")
+        results_df.at[row_index, "final_match2_t2"] = row.get("final_match2_t2", "")
+        results_df.at[row_index, "final_match2_equal_prefix"] = bool(row.get("final_match2_equal_prefix", False))
+        results_df.at[row_index, "final_match2_score"] = row.get("final_match2_score", pd.NA)
+        final_norm_for_metrics = str(results_df.at[row_index, "final_match_t2_norm"] or group_norm or "")
+        if (final_status != "SEM_MATCH" or final_method == "EXCESS_LEFT") and final_norm_for_metrics:
             ordered_score = ordered_character_ratio(source_norm, final_norm_for_metrics)
             aligned_score = aligned_character_ratio(source_norm, final_norm_for_metrics)
             length_gap = abs(len(source_norm) - len(final_norm_for_metrics))
@@ -1239,6 +1533,12 @@ def recompute_final_state(
             ordered_score,
             aligned_score,
             bool(same_name_length) if pd.notna(same_name_length) else False,
+            final_method=final_method,
+            source_norm=source_norm,
+            final_norm=final_norm_for_metrics,
+            match2_equal_prefix=bool(row.get("final_match2_equal_prefix", False)),
+            match2_active=bool(config and config.get("match2_col_t1") and config.get("match2_col_t2")),
+            match2_values_present=bool(str(row.get("final_match2_t1", "") or "").strip() and str(row.get("final_match2_t2", "") or "").strip()),
             config=config,
         )
         results_df.at[row_index, "final_conflict_flags"] = flags_to_text(final_flags)
@@ -1265,32 +1565,27 @@ def export_analysis_result(
     result.preview_df = result.results_df.head(40).copy()
     result.quota_df = build_quota_summary(result.results_df, result.catalog_df)
 
-    conflicts_df = result.results_df[result.results_df["final_conflict_flags"].fillna("") != ""].copy()
-    accepted_df = result.results_df[result.results_df["final_status"] == "ACEITO"].copy()
-    review_df = result.results_df[result.results_df["final_status"] == "REVISAR"].copy()
-    sem_match_df = result.results_df[result.results_df["final_status"] == "SEM_MATCH"].copy()
-    used_targets = set(accepted_df["final_match_t2_norm"].dropna().astype(str))
-    full_catalog = build_export_catalog(result)
-    unused_targets_df = full_catalog[~full_catalog["nome_t2_norm"].isin(used_targets)].copy() if not full_catalog.empty else pd.DataFrame()
-    export_all_df = build_ordered_export_df(result.results_df)
-    export_accepted_df = build_ordered_export_df(accepted_df)
-    export_review_df = build_ordered_export_df(review_df)
-    export_sem_match_df = build_ordered_export_df(sem_match_df)
+    source_original_columns = extract_original_columns(result.source_df, "source_row_id")
+    target_original_columns = extract_original_columns(result.target_df, "target_row_id")
+    export_source_df = result.source_df[source_original_columns].copy()
+    export_target_df = result.target_df[target_original_columns].copy()
+    results_export_df = build_results_export_df(result)
+    summary_rows_df = build_export_summary_rows(result)
+    reconciliation_df = build_grouped_reconciliation_df(result)
+    result.grouped_reconciliation_df = reconciliation_df.copy()
+    results_startrow = len(summary_rows_df) + 2
 
     emit_progress(progress_callback, "Escrevendo arquivo Excel...", 55)
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        result.summary_df.to_excel(writer, sheet_name="resumo", index=False)
-        export_all_df.to_excel(writer, sheet_name="resultados_todos", index=False)
-        export_accepted_df.to_excel(writer, sheet_name="aceitos", index=False)
-        export_review_df.to_excel(writer, sheet_name="revisao_pendente", index=False)
-        export_sem_match_df.to_excel(writer, sheet_name="sem_match", index=False)
-        conflicts_df.to_excel(writer, sheet_name="conflitos", index=False)
-        result.quota_df.to_excel(writer, sheet_name="quotas_t2", index=False)
-        result.candidates_df.to_excel(writer, sheet_name="candidatos", index=False)
-        unused_targets_df.to_excel(writer, sheet_name="t2_nao_utilizados", index=False)
+        export_source_df.to_excel(writer, sheet_name="excel_1_original", index=False)
+        export_target_df.to_excel(writer, sheet_name="excel_2_original", index=False)
+        summary_rows_df.to_excel(writer, sheet_name="resultados_match", index=False)
+        results_export_df.to_excel(writer, sheet_name="resultados_match", index=False, startrow=results_startrow)
+        visible_cols = [column for column in reconciliation_df.columns if not column.startswith("_")]
+        reconciliation_df[visible_cols].to_excel(writer, sheet_name="conciliacao_quantidades", index=False)
 
     emit_progress(progress_callback, "Formatando arquivo...", 88)
-    format_output_workbook(output_path)
+    format_output_workbook(output_path, result, results_startrow)
     emit_progress(progress_callback, f"Exportação concluída: {output_path}", 100)
     return output_path
 
@@ -1361,6 +1656,239 @@ def build_ordered_export_df(df: pd.DataFrame) -> pd.DataFrame:
     return ordered_df.reset_index(drop=True)
 
 
+def extract_original_columns(df: pd.DataFrame, marker_column: str) -> list[str]:
+    columns: list[str] = []
+    for column in df.columns:
+        if column == marker_column:
+            break
+        columns.append(column)
+    return columns
+
+
+def build_results_export_df(result: AnalysisResult) -> pd.DataFrame:
+    mode = str(result.config.get("output_mode", "enxuta")).strip().lower()
+    if mode == "tecnica":
+        return build_ordered_export_df(result.results_df)
+
+    columns = [
+        "excel_row_t1",
+        "nome_t1_original",
+        "final_status",
+        "final_method",
+        "final_match_t2_original",
+        "final_score",
+        "final_score_composite",
+        "final_match2_t1",
+        "final_match2_t2",
+        "final_match2_equal_prefix",
+        "final_match2_score",
+        "final_color_bucket",
+        "final_conflict_flags",
+    ]
+    return result.results_df[[column for column in columns if column in result.results_df.columns]].copy()
+
+
+def build_export_summary_rows(result: AnalysisResult) -> pd.DataFrame:
+    results_df = result.results_df
+    source_total = len(result.source_df)
+    target_total = len(result.target_df)
+    accepted = int((results_df["final_status"] == "ACEITO").sum())
+    review = int((results_df["final_status"] == "REVISAR").sum())
+    no_match = int((results_df["final_status"] == "SEM_MATCH").sum())
+    excess_left = int((results_df["final_method"] == "EXCESS_LEFT").sum())
+    used_targets = int(results_df.loc[results_df["final_match_t2_norm"] != "", "final_group_t2_norm"].replace("", pd.NA).dropna().shape[0])
+    unused_targets = max(target_total - int((result.results_df["final_status"] == "ACEITO").sum()), 0)
+    bucket_counts = results_df["final_color_bucket"].fillna("SEM_BUCKET").value_counts().to_dict()
+    lines = [
+        ("Métrica", "Valor"),
+        ("Total de linhas Excel 1", source_total),
+        ("Total de linhas Excel 2", target_total),
+        ("Diferença total (Excel 1 - Excel 2)", source_total - target_total),
+        ("Aceitos no Excel 1", accepted),
+        ("Revisão no Excel 1", review),
+        ("Sem match no Excel 1", no_match),
+        ("Excedente por quantidade no Excel 1", excess_left),
+        ("Linhas utilizadas do Excel 2", target_total - unused_targets),
+        ("Linhas não utilizadas do Excel 2", unused_targets),
+    ]
+    for bucket, count in sorted(bucket_counts.items()):
+        lines.append((f"Bucket {bucket}", count))
+    return pd.DataFrame(lines, columns=["Métrica", "Valor"])
+
+
+def _parse_optional_datetime(value: Any) -> pd.Timestamp | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    parsed = pd.to_datetime(text, errors="coerce", dayfirst=True, format="mixed")
+    if pd.isna(parsed):
+        return None
+    return parsed
+
+
+def _pair_group_rows_by_match2(
+    left_rows: list[dict[str, Any]],
+    right_rows: list[dict[str, Any]],
+    match2_prefix_chars: int,
+) -> list[tuple[dict[str, Any] | None, dict[str, Any] | None]]:
+    if not left_rows and not right_rows:
+        return []
+    if not left_rows:
+        return [(None, right) for right in right_rows]
+    if not right_rows:
+        return [(left, None) for left in left_rows]
+
+    prefix_chars = max(int(match2_prefix_chars or 1), 1)
+    remaining_right = set(range(len(right_rows)))
+    assigned_right_by_left: dict[int, int] = {}
+
+    def normalize_prefix(value: Any) -> str:
+        return str(value or "").strip().upper()[:prefix_chars]
+
+    # 1) Exact/Prefix-equal first when match2 exists on both sides.
+    for left_idx, left in enumerate(left_rows):
+        left_prefix = normalize_prefix(left.get("final_match2_t1", ""))
+        if not left_prefix:
+            continue
+        exact_candidates = [
+            right_idx
+            for right_idx in remaining_right
+            if normalize_prefix(right_rows[right_idx].get("match2_t2_original", "")) == left_prefix
+        ]
+        if exact_candidates:
+            chosen = min(exact_candidates, key=lambda idx: int(right_rows[idx].get("target_row_id", 0)))
+            assigned_right_by_left[left_idx] = chosen
+            remaining_right.remove(chosen)
+
+    # 2) If no exact match, align by date proximity when parseable.
+    for left_idx, left in enumerate(left_rows):
+        if left_idx in assigned_right_by_left:
+            continue
+        left_dt = _parse_optional_datetime(left.get("final_match2_t1", ""))
+        if left_dt is None:
+            continue
+        dated_candidates: list[tuple[int, float]] = []
+        for right_idx in remaining_right:
+            right_dt = _parse_optional_datetime(right_rows[right_idx].get("match2_t2_original", ""))
+            if right_dt is None:
+                continue
+            delta = abs((left_dt - right_dt).total_seconds())
+            dated_candidates.append((right_idx, delta))
+        if dated_candidates:
+            chosen = min(dated_candidates, key=lambda item: (item[1], int(right_rows[item[0]].get("target_row_id", 0))))[0]
+            assigned_right_by_left[left_idx] = chosen
+            remaining_right.remove(chosen)
+
+    # 3) Fallback: keep deterministic order for leftovers.
+    for left_idx, _left in enumerate(left_rows):
+        if left_idx in assigned_right_by_left:
+            continue
+        if not remaining_right:
+            break
+        chosen = min(remaining_right, key=lambda idx: int(right_rows[idx].get("target_row_id", 0)))
+        assigned_right_by_left[left_idx] = chosen
+        remaining_right.remove(chosen)
+
+    pairs: list[tuple[dict[str, Any] | None, dict[str, Any] | None]] = []
+    for left_idx, left in enumerate(left_rows):
+        right = right_rows[assigned_right_by_left[left_idx]] if left_idx in assigned_right_by_left else None
+        pairs.append((left, right))
+    for right_idx in sorted(remaining_right, key=lambda idx: int(right_rows[idx].get("target_row_id", 0))):
+        pairs.append((None, right_rows[right_idx]))
+    return pairs
+
+
+def build_grouped_reconciliation_df(result: AnalysisResult) -> pd.DataFrame:
+    results_df = result.results_df.copy()
+    target_df = result.target_df.copy()
+    if results_df.empty and target_df.empty:
+        return pd.DataFrame(columns=["Excel 1", "Excel 2", "_bucket_left", "_bucket_right"])
+
+    target_records = target_df.to_dict("records")
+    targets_by_norm: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for record in target_records:
+        targets_by_norm[str(record.get("nome_t2_norm") or "")].append(record)
+
+    for norm in targets_by_norm:
+        targets_by_norm[norm].sort(key=lambda item: int(item.get("target_row_id", 0)))
+
+    result_records = results_df.to_dict("records")
+    extra_cols_t1 = parse_csv_columns(result.config.get("tab4_extra_cols_t1", ""))
+    extra_cols_t2 = parse_csv_columns(result.config.get("tab4_extra_cols_t2", ""))
+    if result.config.get("match2_col_t1"):
+        source_match2_col_index = excel_col_to_index(result.config["match2_col_t1"])
+        source_original = extract_original_columns(result.source_df, "source_row_id")
+        if source_match2_col_index < len(source_original):
+            default_col = source_original[source_match2_col_index]
+            if default_col not in extra_cols_t1:
+                extra_cols_t1.insert(0, default_col)
+    if result.config.get("match2_col_t2"):
+        target_match2_col_index = excel_col_to_index(result.config["match2_col_t2"])
+        target_original = extract_original_columns(result.target_df, "target_row_id")
+        if target_match2_col_index < len(target_original):
+            default_col = target_original[target_match2_col_index]
+            if default_col not in extra_cols_t2:
+                extra_cols_t2.insert(0, default_col)
+
+    source_records_by_id = {
+        int(row["source_row_id"]): row for row in result.source_df.to_dict("records")
+    } if not result.source_df.empty else {}
+    groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for record in result_records:
+        group_key = str(record.get("final_group_t2_norm") or record.get("nome_t1_norm") or "")
+        groups[group_key].append(record)
+
+    all_group_keys = sorted(set(groups.keys()) | set(targets_by_norm.keys()))
+    rows: list[dict[str, Any]] = []
+    for group_key in all_group_keys:
+        left_rows = groups.get(group_key, [])
+        left_rows.sort(
+            key=lambda item: (
+                {"EXACT": 0, "MATCH": 1, "REVIEW": 2, "EXCESS_LEFT": 3, "NO_MATCH": 4}.get(
+                    str(item.get("final_color_bucket") or "NO_MATCH"), 9
+                ),
+                0 if bool(item.get("final_match2_equal_prefix", False)) else 1,
+                -(safe_float(item.get("final_match2_score")) or 0.0),
+                int(item.get("source_row_id", 0)),
+            )
+        )
+        right_rows = targets_by_norm.get(group_key, [])
+        pairs = _pair_group_rows_by_match2(
+            left_rows,
+            right_rows,
+            int(result.config.get("match2_prefix_chars", 8)),
+        )
+        if not pairs:
+            pairs = [(None, None)]
+        for left, right in pairs:
+            left_bucket = str(left.get("final_color_bucket") or "NO_MATCH") if left else ""
+            right_bucket = left_bucket if right and left else ("NO_MATCH" if right else "")
+            rows.append(
+                {
+                    "Excel 1": str(left.get("nome_t1_original") or "") if left else "",
+                    "Excel 2": str(right.get("nome_t2_original") or "") if right else "",
+                    "_bucket_left": left_bucket,
+                    "_bucket_right": right_bucket,
+                    "_group_key": group_key,
+                }
+            )
+            if left:
+                source_info = source_records_by_id.get(int(left.get("source_row_id", 0)), {})
+                for column in extra_cols_t1:
+                    rows[-1][f"E1:{column}"] = str(source_info.get(column, "") or "")
+            else:
+                for column in extra_cols_t1:
+                    rows[-1][f"E1:{column}"] = ""
+            if right:
+                for column in extra_cols_t2:
+                    rows[-1][f"E2:{column}"] = str(right.get(column, "") or "")
+            else:
+                for column in extra_cols_t2:
+                    rows[-1][f"E2:{column}"] = ""
+        rows.append({"Excel 1": "", "Excel 2": "", "_bucket_left": "", "_bucket_right": "", "_group_key": ""})
+    return pd.DataFrame(rows)
+
+
 def run_matching(config: dict[str, Any], progress_callback: ProgressCallback | None = None) -> Path:
     result = analyze_matching(config, progress_callback=progress_callback)
     return export_analysis_result(result, progress_callback=progress_callback)
@@ -1419,14 +1947,28 @@ class MatcherApp:
         self.last_manual_actions: list[str] = []
 
         self.vars: dict[str, tk.Variable] = {
-            "input_file": tk.StringVar(),
+            "input_file_t1": tk.StringVar(),
+            "input_file_t2": tk.StringVar(),
             "output_file": tk.StringVar(value="resultado_matching.xlsx"),
-            "sheet_t1": tk.StringVar(value="Tabela1"),
-            "sheet_t2": tk.StringVar(value="Tabela2"),
+            "sheet_t1": tk.StringVar(),
+            "sheet_t2": tk.StringVar(),
             "header_row_t1": tk.StringVar(value="1"),
             "header_row_t2": tk.StringVar(value="1"),
             "name_col_t1": tk.StringVar(value="C"),
             "name_col_t2": tk.StringVar(value="E"),
+            "match2_col_t1": tk.StringVar(value=""),
+            "match2_col_t2": tk.StringVar(value=""),
+            "match2_prefix_chars": tk.StringVar(value="8"),
+            "match2_weight": tk.StringVar(value="0.2"),
+            "tab4_extra_cols_t1": tk.StringVar(value=""),
+            "tab4_extra_cols_t2": tk.StringVar(value=""),
+            "output_mode": tk.StringVar(value="enxuta"),
+            "quantity_resolution_mode": tk.StringVar(value="marcar_excedente_excel1"),
+            "color_exact": tk.StringVar(value=DEFAULT_MATCH_COLORS["color_exact"]),
+            "color_match": tk.StringVar(value=DEFAULT_MATCH_COLORS["color_match"]),
+            "color_review": tk.StringVar(value=DEFAULT_MATCH_COLORS["color_review"]),
+            "color_no_match": tk.StringVar(value=DEFAULT_MATCH_COLORS["color_no_match"]),
+            "color_excess_left": tk.StringVar(value=DEFAULT_MATCH_COLORS["color_excess_left"]),
             "max_external_chars": tk.StringVar(value="30"),
             "accept_score": tk.StringVar(value="92"),
             "review_score": tk.StringVar(value="85"),
@@ -1454,6 +1996,11 @@ class MatcherApp:
         self.review_search_var = tk.StringVar()
         self.review_hint_var = tk.StringVar(value="Selecione uma linha da fila para ver motivos, candidatos e ações rápidas.")
         self.export_snapshot_var = tk.StringVar(value="Nenhuma exportação executada nesta sessão.")
+        self.match1_limit_hint_var = tk.StringVar(value="Match 1 efetivo: 30 caracteres")
+        self.sheet_options_t1: list[str] = []
+        self.sheet_options_t2: list[str] = []
+        self.column_options_t1: list[str] = []
+        self.column_options_t2: list[str] = []
         self.summary_card_vars = {
             "total": tk.StringVar(value="0"),
             "accepted": tk.StringVar(value="0"),
@@ -1465,7 +2012,10 @@ class MatcherApp:
 
         self._build_ui()
         self._bind_shortcuts()
+        self.vars["max_external_chars"].trace_add("write", lambda *_args: self.update_match1_limit_hint())
         self.load_ui_state()
+        self.update_match1_limit_hint()
+        self.refresh_sheet_choices()
         self.update_config_mode()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -1526,12 +2076,63 @@ class MatcherApp:
         self.notebook.add(self.tab_review, text="Revisão")
         self.notebook.add(self.tab_export, text="Exportação")
 
+        self._build_config_scroll_container()
         self._build_config_tab()
         self._build_analyze_tab()
         self._build_review_tab()
         self._build_export_tab()
 
         self.log("Aplicação iniciada.")
+
+    def _build_config_scroll_container(self) -> None:
+        self.tab_config_canvas = tk.Canvas(
+            self.tab_config,
+            highlightthickness=0,
+            bg=UI_COLORS["bg"],
+        )
+        self.tab_config_scrollbar = ttk.Scrollbar(
+            self.tab_config,
+            orient="vertical",
+            command=self.tab_config_canvas.yview,
+        )
+        self.tab_config_canvas.configure(yscrollcommand=self.tab_config_scrollbar.set)
+        self.tab_config_scrollbar.pack(side="right", fill="y")
+        self.tab_config_canvas.pack(side="left", fill="both", expand=True)
+        self.tab_config_content = ttk.Frame(self.tab_config_canvas, padding=2)
+        self._tab_config_window_id = self.tab_config_canvas.create_window(
+            (0, 0),
+            window=self.tab_config_content,
+            anchor="nw",
+        )
+        self.tab_config_content.bind(
+            "<Configure>",
+            lambda _event: self.tab_config_canvas.configure(scrollregion=self.tab_config_canvas.bbox("all")),
+        )
+        self.tab_config_canvas.bind(
+            "<Configure>",
+            lambda event: self.tab_config_canvas.itemconfigure(self._tab_config_window_id, width=event.width),
+        )
+        self.tab_config_canvas.bind("<Enter>", self._bind_config_mousewheel)
+        self.tab_config_canvas.bind("<Leave>", self._unbind_config_mousewheel)
+
+    def _bind_config_mousewheel(self, _event=None) -> None:
+        self.tab_config_canvas.bind_all("<MouseWheel>", self._on_config_mousewheel)
+
+    def _unbind_config_mousewheel(self, _event=None) -> None:
+        self.tab_config_canvas.unbind_all("<MouseWheel>")
+
+    def _on_config_mousewheel(self, event) -> None:
+        self.tab_config_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    def update_match1_limit_hint(self) -> None:
+        raw = str(self.vars["max_external_chars"].get() or "").strip()
+        try:
+            value = int(raw)
+            if value <= 0:
+                raise ValueError()
+            self.match1_limit_hint_var.set(f"Match 1 efetivo: {value} caracteres")
+        except ValueError:
+            self.match1_limit_hint_var.set("Match 1 efetivo: valor inválido (use inteiro > 0)")
 
     def _configure_styles(self) -> None:
         try:
@@ -1663,7 +2264,7 @@ class MatcherApp:
             pass
 
     def _bind_shortcuts(self) -> None:
-        self.root.bind_all("<Control-o>", lambda _event: self.pick_input_file())
+        self.root.bind_all("<Control-o>", lambda _event: self.pick_input_file_t1())
         self.root.bind_all("<F5>", lambda _event: self.validate_and_preview())
         self.root.bind_all("<Control-r>", lambda _event: self.start_analysis())
         self.root.bind_all("<Control-e>", lambda _event: self.start_export())
@@ -1823,10 +2424,13 @@ class MatcherApp:
             return
         try:
             payload = json.loads(UI_STATE_FILE.read_text(encoding="utf-8"))
+            legacy_input = payload.get("vars", {}).get("input_file")
             for key, value in payload.get("vars", {}).items():
                 variable = self.vars.get(key)
                 if variable is not None:
                     variable.set(value)
+            if legacy_input and not self.vars["input_file_t1"].get():
+                self.vars["input_file_t1"].set(legacy_input)
             self.quick_preset_var.set(payload.get("quick_preset", self.quick_preset_var.get()))
             self.config_mode_var.set(payload.get("config_mode", self.config_mode_var.get()))
             self.review_filter_var.set(payload.get("review_filter", self.review_filter_var.get()))
@@ -1839,8 +2443,9 @@ class MatcherApp:
         self.root.destroy()
 
     def _build_config_tab(self) -> None:
-        mode_frame = ttk.LabelFrame(self.tab_config, text="Modo de configuração", padding=10)
-        mode_frame.pack(fill="x", pady=(0, 8))
+        config_parent = self.tab_config_content
+        mode_frame = ttk.LabelFrame(config_parent, text="Modo de configuração", padding=8)
+        mode_frame.pack(fill="x", pady=(0, 6))
         ttk.Label(mode_frame, text="Nível de detalhe").pack(side="left")
         mode_box = ttk.Combobox(
             mode_frame,
@@ -1849,52 +2454,102 @@ class MatcherApp:
             state="readonly",
             width=18,
         )
-        mode_box.pack(side="left", padx=(8, 12))
+        mode_box.pack(side="left", padx=(6, 10))
         mode_box.bind("<<ComboboxSelected>>", self.update_config_mode)
         ttk.Label(
             mode_frame,
             text="Básico mostra o essencial, Avançado libera cotas e Especialista expõe pesos finos.",
         ).pack(side="left")
 
-        files_frame = ttk.LabelFrame(self.tab_config, text="Arquivos", padding=10)
-        files_frame.pack(fill="x", pady=(0, 8))
-        self._add_file_row(files_frame, "Planilha de entrada", "input_file", self.pick_input_file, 0)
-        self._add_file_row(files_frame, "Planilha de saída", "output_file", self.pick_output_file, 1)
+        files_frame = ttk.LabelFrame(config_parent, text="Arquivos", padding=8)
+        files_frame.pack(fill="x", pady=(0, 6))
+        self._add_file_row(files_frame, "Planilha Excel 1", "input_file_t1", self.pick_input_file_t1, 0)
+        self._add_file_row(files_frame, "Planilha Excel 2", "input_file_t2", self.pick_input_file_t2, 1)
+        self._add_file_row(files_frame, "Planilha de saída", "output_file", self.pick_output_file, 2)
 
-        workbook_frame = ttk.LabelFrame(self.tab_config, text="Mapeamento da planilha", padding=10)
-        workbook_frame.pack(fill="x", pady=(0, 8))
-        workbook_fields = [
-            ("Aba T1", "sheet_t1", "Aba que define as linhas de saída."),
-            ("Aba T2", "sheet_t2", "Aba que fornece os candidatos de correspondência."),
-            ("Linha de cabeçalho T1", "header_row_t1", "Número da linha (base 1) onde o cabeçalho começa na Tabela 1."),
-            ("Linha de cabeçalho T2", "header_row_t2", "Número da linha (base 1) onde o cabeçalho começa na Tabela 2."),
-            ("Coluna de nome T1", "name_col_t1", "Letra da coluna no Excel que contém o nome na Tabela 1."),
-            ("Coluna de nome T2", "name_col_t2", "Letra da coluna no Excel que contém o nome na Tabela 2."),
-        ]
-        for index, (label, key, tooltip) in enumerate(workbook_fields):
-            row = index // 2
-            col = (index % 2) * 3
-            self._add_setting_field(workbook_frame, row, col, label, key, tooltip)
+        workbook_frame = ttk.LabelFrame(config_parent, text="Mapeamento da planilha", padding=8)
+        workbook_frame.pack(fill="x", pady=(0, 6))
+        self._add_sheet_field(workbook_frame, 0, 0, "Aba Excel 1", "sheet_t1", "Aba principal do Excel 1; por padrão a primeira aba encontrada.")
+        self._add_sheet_field(workbook_frame, 0, 3, "Aba Excel 2", "sheet_t2", "Aba principal do Excel 2; por padrão a primeira aba encontrada.")
+        self._add_setting_field(workbook_frame, 1, 0, "Linha de cabeçalho Excel 1", "header_row_t1", "Número da linha (base 1) onde o cabeçalho começa no Excel 1.")
+        self._add_setting_field(workbook_frame, 1, 3, "Linha de cabeçalho Excel 2", "header_row_t2", "Número da linha (base 1) onde o cabeçalho começa no Excel 2.")
+        self._add_setting_field(workbook_frame, 2, 0, "Coluna de nome Excel 1", "name_col_t1", "Letra da coluna no Excel 1 que contém o nome a casar.")
+        self._add_setting_field(workbook_frame, 2, 3, "Coluna de nome Excel 2", "name_col_t2", "Letra da coluna no Excel 2 que contém o nome alvo.")
+        self._add_setting_field(workbook_frame, 3, 0, "Coluna match 2 Excel 1", "match2_col_t1", "Opcional: segunda coluna para comparação auxiliar (ex.: data).")
+        self._add_setting_field(workbook_frame, 3, 3, "Coluna match 2 Excel 2", "match2_col_t2", "Opcional: segunda coluna para comparação auxiliar (ex.: data).")
+        self._add_setting_field(workbook_frame, 4, 0, "Caracteres do match 2", "match2_prefix_chars", "Quantidade de caracteres usados na comparação auxiliar da coluna match 2.")
+        self._add_setting_field(workbook_frame, 4, 3, "Peso do match 2", "match2_weight", "Peso auxiliar no score composto. Não bloqueia match por si só.")
         for column in (1, 4):
             workbook_frame.columnconfigure(column, weight=1)
 
-        recommended_frame = ttk.LabelFrame(self.tab_config, text="Padrões recomendados", padding=10)
-        recommended_frame.pack(fill="x", pady=(0, 8))
+        output_frame = ttk.LabelFrame(config_parent, text="Saída e cores", padding=8)
+        output_frame.pack(fill="x", pady=(0, 6))
+        self._add_combobox_field(
+            output_frame,
+            0,
+            0,
+            "Modo da aba 3",
+            "output_mode",
+            ["enxuta", "tecnica"],
+            "Define se a terceira aba será enxuta ou técnica.",
+        )
+        self._add_combobox_field(
+            output_frame,
+            0,
+            3,
+            "Regra de quantidade",
+            "quantity_resolution_mode",
+            ["marcar_excedente_excel1"],
+            "Quando houver mais ocorrências no Excel 1 que no Excel 2, apenas as disponíveis serão casadas e o restante ficará destacado.",
+        )
+        self._add_color_field(output_frame, 1, 0, "Cor match exato", "color_exact")
+        self._add_color_field(output_frame, 1, 3, "Cor match aceito", "color_match")
+        self._add_color_field(output_frame, 2, 0, "Cor revisão", "color_review")
+        self._add_color_field(output_frame, 2, 3, "Cor sem match", "color_no_match")
+        self._add_color_field(output_frame, 3, 0, "Cor excedente Excel 1", "color_excess_left")
+        self._add_csv_column_field(
+            output_frame,
+            4,
+            0,
+            "Extras aba 4 (Excel 1)",
+            "tab4_extra_cols_t1",
+            "Colunas extras exibidas na aba 4 para Excel 1 (separadas por vírgula).",
+            side="t1",
+        )
+        self._add_csv_column_field(
+            output_frame,
+            4,
+            3,
+            "Extras aba 4 (Excel 2)",
+            "tab4_extra_cols_t2",
+            "Colunas extras exibidas na aba 4 para Excel 2 (separadas por vírgula).",
+            side="t2",
+        )
+        output_frame.columnconfigure(1, weight=1)
+        output_frame.columnconfigure(4, weight=1)
+
+        recommended_frame = ttk.LabelFrame(config_parent, text="Padrões recomendados", padding=8)
+        recommended_frame.pack(fill="x", pady=(0, 6))
+        ttk.Label(
+            recommended_frame,
+            textvariable=self.match1_limit_hint_var,
+            font=("Segoe UI", 9, "bold"),
+        ).grid(row=0, column=0, columnspan=6, sticky="w", padx=4, pady=(0, 4))
         recommended_fields = [
-            ("Tamanho do prefixo", "max_external_chars", "Compara o início do nome normalizado e mantém compatibilidade com nomes externos truncados."),
+            ("Limite de caracteres (Match 1)", "max_external_chars", "Limita efetivamente os nomes do Match 1 aos primeiros N caracteres antes da comparação."),
             ("Pontuação de aceite", "accept_score", "Candidatos acima desta pontuação podem ser aceitos automaticamente quando estrutura e diferença também forem fortes."),
             ("Pontuação de revisão", "review_score", "Candidatos acima desta pontuação entram em revisão manual quando não forem seguros para aceite automático."),
             ("Diferença mínima", "min_gap_for_accept", "Diferença mínima para o próximo candidato necessária para aceite automático seguro."),
             ("Candidatos em prévia", "top_candidates_to_keep", "Quantidade de candidatos mantidos para pré-visualização e revisão manual."),
         ]
         for index, (label, key, tooltip) in enumerate(recommended_fields):
-            row = index // 2
+            row = index // 2 + 1
             col = (index % 2) * 3
             self._add_setting_field(recommended_frame, row, col, label, key, tooltip)
         for column in (1, 4):
             recommended_frame.columnconfigure(column, weight=1)
 
-        self.advanced_frame = ttk.LabelFrame(self.tab_config, text="Controles avançados", padding=10)
+        self.advanced_frame = ttk.LabelFrame(config_parent, text="Controles avançados", padding=8)
         self._add_setting_field(
             self.advanced_frame,
             0,
@@ -1916,7 +2571,7 @@ class MatcherApp:
             variable=self.vars["auto_open_output"],
         ).grid(row=1, column=3, columnspan=3, sticky="w", padx=6, pady=(6, 4))
 
-        self.expert_frame = ttk.LabelFrame(self.tab_config, text="Ajustes finos do algoritmo", padding=10)
+        self.expert_frame = ttk.LabelFrame(config_parent, text="Ajustes finos do algoritmo", padding=8)
         advanced_weight_fields = [
             ("Peso token-set", "weight_token_set", "Quanto a sobreposição de tokens influencia a pontuação final."),
             ("Peso parcial", "weight_partial", "Quanto a similaridade parcial de substring influencia a pontuação final."),
@@ -1935,14 +2590,14 @@ class MatcherApp:
         for column in (1, 4):
             self.expert_frame.columnconfigure(column, weight=1)
 
-        button_row = ttk.Frame(self.tab_config)
-        button_row.pack(fill="x", pady=(0, 8))
+        button_row = ttk.Frame(config_parent)
+        button_row.pack(fill="x", pady=(0, 6))
         ttk.Button(button_row, text="Preencher nome de saída", command=self.autofill_output_name, style="Info.TButton").pack(side="left")
         ttk.Button(button_row, text="Validar + Pré-visualizar planilha", command=self.validate_and_preview, style="Warning.TButton").pack(side="left", padx=8)
         ttk.Button(button_row, text="Salvar configuração visual", command=lambda: self.save_ui_state(show_feedback=True), style="Primary.TButton").pack(side="left", padx=8)
         ttk.Button(button_row, text="Iniciar análise", command=self.start_analysis, style="Success.TButton").pack(side="left", padx=8)
 
-        preview_frame = ttk.LabelFrame(self.tab_config, text="Prévia da validação", padding=10)
+        preview_frame = ttk.LabelFrame(config_parent, text="Prévia da validação", padding=8)
         preview_frame.pack(fill="both", expand=True)
         self.validation_text = tk.Text(
             preview_frame,
@@ -2049,7 +2704,9 @@ class MatcherApp:
         ttk.Button(queue_toolbar, text="Limpar", command=self.clear_review_filters, style="Info.TButton").pack(side="left")
 
         queue_columns = ("row", "name", "status", "flags", "suggested")
-        self.review_tree = ttk.Treeview(queue_frame, columns=queue_columns, show="headings", height=24)
+        queue_tree_container = ttk.Frame(queue_frame)
+        queue_tree_container.pack(fill="both", expand=True)
+        self.review_tree = ttk.Treeview(queue_tree_container, columns=queue_columns, show="headings", height=24)
         for column, title, width in (
             ("row", "Linha", 70),
             ("name", "Nome T1", 220),
@@ -2059,14 +2716,35 @@ class MatcherApp:
         ):
             self.review_tree.heading(column, text=title)
             self.review_tree.column(column, width=width, anchor="w")
+        review_tree_scrollbar = ttk.Scrollbar(queue_tree_container, orient="vertical", command=self.review_tree.yview)
+        self.review_tree.configure(yscrollcommand=review_tree_scrollbar.set)
         self._configure_status_tree(self.review_tree)
-        self.review_tree.pack(fill="both", expand=True)
+        self.review_tree.pack(side="left", fill="both", expand=True)
+        review_tree_scrollbar.pack(side="right", fill="y")
         self.review_tree.bind("<<TreeviewSelect>>", self.on_review_row_selected)
 
-        ttk.Label(detail_frame, textvariable=self.review_hint_var, font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(0, 6))
-        ttk.Label(detail_frame, text="Prévia da linha").pack(anchor="w")
+        detail_canvas = tk.Canvas(detail_frame, highlightthickness=0, bg=UI_COLORS["panel"])
+        detail_scrollbar = ttk.Scrollbar(detail_frame, orient="vertical", command=detail_canvas.yview)
+        detail_canvas.configure(yscrollcommand=detail_scrollbar.set)
+        detail_scrollbar.pack(side="right", fill="y")
+        detail_canvas.pack(side="left", fill="both", expand=True)
+        detail_content = ttk.Frame(detail_canvas)
+        detail_window_id = detail_canvas.create_window((0, 0), window=detail_content, anchor="nw")
+        detail_content.bind(
+            "<Configure>",
+            lambda _event: detail_canvas.configure(scrollregion=detail_canvas.bbox("all")),
+        )
+        detail_canvas.bind(
+            "<Configure>",
+            lambda event: detail_canvas.itemconfigure(detail_window_id, width=event.width),
+        )
+        detail_canvas.bind("<Enter>", lambda _event: detail_canvas.bind_all("<MouseWheel>", lambda e: detail_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")))
+        detail_canvas.bind("<Leave>", lambda _event: detail_canvas.unbind_all("<MouseWheel>"))
+
+        ttk.Label(detail_content, textvariable=self.review_hint_var, font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(0, 6))
+        ttk.Label(detail_content, text="Prévia da linha").pack(anchor="w")
         self.review_detail_text = tk.Text(
-            detail_frame,
+            detail_content,
             height=10,
             wrap="word",
             bg=UI_COLORS["field"],
@@ -2076,9 +2754,11 @@ class MatcherApp:
         )
         self.review_detail_text.pack(fill="x", pady=(0, 8))
 
-        ttk.Label(detail_frame, text="Prévia de candidatos").pack(anchor="w")
+        ttk.Label(detail_content, text="Prévia de candidatos").pack(anchor="w")
         candidate_columns = ("rank", "candidate", "score", "ordered", "aligned", "auto", "review", "quota")
-        self.candidate_tree = ttk.Treeview(detail_frame, columns=candidate_columns, show="headings", height=14)
+        candidate_container = ttk.Frame(detail_content)
+        candidate_container.pack(fill="both", expand=True, pady=(0, 8))
+        self.candidate_tree = ttk.Treeview(candidate_container, columns=candidate_columns, show="headings", height=14)
         for column, title, width in (
             ("rank", "Rank", 60),
             ("candidate", "Candidato T2", 260),
@@ -2091,14 +2771,17 @@ class MatcherApp:
         ):
             self.candidate_tree.heading(column, text=title)
             self.candidate_tree.column(column, width=width, anchor="w")
-        self.candidate_tree.pack(fill="both", expand=True, pady=(0, 8))
+        candidate_tree_scrollbar = ttk.Scrollbar(candidate_container, orient="vertical", command=self.candidate_tree.yview)
+        self.candidate_tree.configure(yscrollcommand=candidate_tree_scrollbar.set)
+        self.candidate_tree.pack(side="left", fill="both", expand=True)
+        candidate_tree_scrollbar.pack(side="right", fill="y")
 
-        note_frame = ttk.Frame(detail_frame)
+        note_frame = ttk.Frame(detail_content)
         note_frame.pack(fill="x", pady=(0, 8))
         ttk.Label(note_frame, text="Observação manual").pack(side="left")
         ttk.Entry(note_frame, textvariable=self.manual_note_var).pack(side="left", fill="x", expand=True, padx=(8, 0))
 
-        buttons = ttk.Frame(detail_frame)
+        buttons = ttk.Frame(detail_content)
         buttons.pack(fill="x")
         ttk.Button(buttons, text="Aceitar candidato selecionado", command=self.accept_selected_candidate, style="Success.TButton").pack(side="left")
         ttk.Button(buttons, text="Marcar sem match", command=self.mark_selected_no_match, style="Danger.TButton").pack(side="left", padx=8)
@@ -2134,10 +2817,151 @@ class MatcherApp:
         self.export_text.pack(fill="both", expand=True)
 
     def _add_file_row(self, parent: ttk.LabelFrame, label: str, var_key: str, command: Callable[[], None], row: int) -> None:
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=6, pady=5)
-        ttk.Entry(parent, textvariable=self.vars[var_key], width=96).grid(row=row, column=1, sticky="ew", padx=6, pady=5)
-        ttk.Button(parent, text="Procurar...", command=command, style="Info.TButton").grid(row=row, column=2, padx=6, pady=5)
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=4, pady=3)
+        ttk.Entry(parent, textvariable=self.vars[var_key], width=88).grid(row=row, column=1, sticky="ew", padx=4, pady=3)
+        ttk.Button(parent, text="Procurar...", command=command, style="Info.TButton").grid(row=row, column=2, padx=4, pady=3)
         parent.columnconfigure(1, weight=1)
+
+    def _add_sheet_field(
+        self,
+        parent: ttk.LabelFrame,
+        row: int,
+        col: int,
+        label: str,
+        var_key: str,
+        tooltip: str,
+    ) -> None:
+        ttk.Label(parent, text=label).grid(row=row, column=col, sticky="w", padx=6, pady=5)
+        combobox = ttk.Combobox(parent, textvariable=self.vars[var_key], state="readonly", width=22)
+        combobox.grid(row=row, column=col + 1, sticky="ew", padx=4, pady=3)
+        combobox.bind("<<ComboboxSelected>>", lambda _event: self.refresh_sheet_choices())
+        if var_key == "sheet_t1":
+            self.sheet_t1_combo = combobox
+        else:
+            self.sheet_t2_combo = combobox
+        info = ttk.Label(parent, text="?", width=2, anchor="center")
+        info.grid(row=row, column=col + 2, sticky="w", padx=(0, 6), pady=3)
+        ToolTip(info, tooltip)
+
+    def _add_combobox_field(
+        self,
+        parent: ttk.LabelFrame,
+        row: int,
+        col: int,
+        label: str,
+        var_key: str,
+        values: list[str],
+        tooltip: str,
+    ) -> None:
+        ttk.Label(parent, text=label).grid(row=row, column=col, sticky="w", padx=4, pady=3)
+        ttk.Combobox(parent, textvariable=self.vars[var_key], values=values, state="readonly", width=24).grid(
+            row=row,
+            column=col + 1,
+            sticky="ew",
+            padx=4,
+            pady=3,
+        )
+        info = ttk.Label(parent, text="?", width=2, anchor="center")
+        info.grid(row=row, column=col + 2, sticky="w", padx=(0, 6), pady=3)
+        ToolTip(info, tooltip)
+
+    def _add_color_field(self, parent: ttk.LabelFrame, row: int, col: int, label: str, var_key: str) -> None:
+        ttk.Label(parent, text=label).grid(row=row, column=col, sticky="w", padx=4, pady=3)
+        frame = ttk.Frame(parent)
+        frame.grid(row=row, column=col + 1, sticky="ew", padx=4, pady=3)
+        ttk.Entry(frame, textvariable=self.vars[var_key], width=16).pack(side="left", fill="x", expand=True)
+        ttk.Button(
+            frame,
+            text="Cor...",
+            command=lambda key=var_key: self.choose_color(key),
+            style="Primary.TButton",
+        ).pack(side="left", padx=(6, 0))
+
+    def _add_csv_column_field(
+        self,
+        parent: ttk.LabelFrame,
+        row: int,
+        col: int,
+        label: str,
+        var_key: str,
+        tooltip: str,
+        side: str,
+    ) -> None:
+        ttk.Label(parent, text=label).grid(row=row, column=col, sticky="w", padx=4, pady=3)
+        frame = ttk.Frame(parent)
+        frame.grid(row=row, column=col + 1, sticky="ew", padx=4, pady=3)
+        ttk.Entry(frame, textvariable=self.vars[var_key], width=24).pack(side="left", fill="x", expand=True)
+        ttk.Button(
+            frame,
+            text="Sugerir",
+            style="Info.TButton",
+            command=lambda key=var_key, side_key=side: self.apply_tab4_default_columns(key, side_key),
+        ).pack(side="left", padx=(6, 0))
+        ttk.Button(
+            frame,
+            text="Todas",
+            style="Primary.TButton",
+            command=lambda key=var_key, side_key=side: self.apply_tab4_all_columns(key, side_key),
+        ).pack(side="left", padx=(4, 0))
+        info = ttk.Label(parent, text="?", width=2, anchor="center")
+        info.grid(row=row, column=col + 2, sticky="w", padx=(0, 6), pady=3)
+        ToolTip(info, tooltip)
+
+    def choose_color(self, var_key: str) -> None:
+        current = str(self.vars[var_key].get() or "")
+        color = f"#{normalize_fill_color(current, DEFAULT_MATCH_COLORS[var_key])[-6:]}"
+        chosen = colorchooser.askcolor(color=color, title=f"Escolher cor para {var_key}")
+        if chosen and chosen[1]:
+            self.vars[var_key].set(normalize_fill_color(chosen[1], DEFAULT_MATCH_COLORS[var_key]))
+            self.save_ui_state()
+
+    def apply_tab4_default_columns(self, var_key: str, side: str) -> None:
+        options = self.column_options_t1 if side == "t1" else self.column_options_t2
+        match_key = "match2_col_t1" if side == "t1" else "match2_col_t2"
+        selected = parse_csv_columns(self.vars[var_key].get())
+        if self.vars[match_key].get():
+            idx = excel_col_to_index(self.vars[match_key].get())
+            if idx < len(options):
+                default_col = options[idx]
+                if default_col not in selected:
+                    selected.insert(0, default_col)
+        serialized = serialize_csv_columns(selected)
+        if serialized != self.vars[var_key].get():
+            self.vars[var_key].set(serialized)
+            self.save_ui_state()
+
+    def apply_tab4_all_columns(self, var_key: str, side: str) -> None:
+        options = self.column_options_t1 if side == "t1" else self.column_options_t2
+        self.vars[var_key].set(serialize_csv_columns(options))
+        self.apply_tab4_default_columns(var_key, side)
+
+    def refresh_sheet_choices(self) -> None:
+        self.sheet_options_t1 = list_workbook_sheets(self.vars["input_file_t1"].get())
+        self.sheet_options_t2 = list_workbook_sheets(self.vars["input_file_t2"].get())
+        if hasattr(self, "sheet_t1_combo"):
+            self.sheet_t1_combo["values"] = self.sheet_options_t1
+        if hasattr(self, "sheet_t2_combo"):
+            self.sheet_t2_combo["values"] = self.sheet_options_t2
+        if self.sheet_options_t1 and self.vars["sheet_t1"].get() not in self.sheet_options_t1:
+            self.vars["sheet_t1"].set(self.sheet_options_t1[0])
+        if self.sheet_options_t2 and self.vars["sheet_t2"].get() not in self.sheet_options_t2:
+            self.vars["sheet_t2"].set(self.sheet_options_t2[0])
+        if not self.sheet_options_t1:
+            self.vars["sheet_t1"].set("")
+        if not self.sheet_options_t2:
+            self.vars["sheet_t2"].set("")
+        try:
+            header_t1 = int(self.vars["header_row_t1"].get() or 1)
+        except ValueError:
+            header_t1 = 1
+        try:
+            header_t2 = int(self.vars["header_row_t2"].get() or 1)
+        except ValueError:
+            header_t2 = 1
+        self.column_options_t1 = list_workbook_columns(self.vars["input_file_t1"].get(), self.vars["sheet_t1"].get(), header_t1)
+        self.column_options_t2 = list_workbook_columns(self.vars["input_file_t2"].get(), self.vars["sheet_t2"].get(), header_t2)
+        self.apply_tab4_default_columns("tab4_extra_cols_t1", "t1")
+        self.apply_tab4_default_columns("tab4_extra_cols_t2", "t2")
 
     def _add_setting_field(
         self,
@@ -2148,10 +2972,13 @@ class MatcherApp:
         var_key: str,
         tooltip: str,
     ) -> None:
-        ttk.Label(parent, text=label).grid(row=row, column=col, sticky="w", padx=6, pady=5)
-        ttk.Entry(parent, textvariable=self.vars[var_key], width=24).grid(row=row, column=col + 1, sticky="ew", padx=6, pady=5)
+        ttk.Label(parent, text=label).grid(row=row, column=col, sticky="w", padx=4, pady=3)
+        entry = ttk.Entry(parent, textvariable=self.vars[var_key], width=22)
+        entry.grid(row=row, column=col + 1, sticky="ew", padx=4, pady=3)
+        if var_key in {"header_row_t1", "header_row_t2", "match2_col_t1", "match2_col_t2"}:
+            entry.bind("<FocusOut>", lambda _event: self.refresh_sheet_choices())
         info = ttk.Label(parent, text="?", width=2, anchor="center")
-        info.grid(row=row, column=col + 2, sticky="w", padx=(0, 8), pady=5)
+        info.grid(row=row, column=col + 2, sticky="w", padx=(0, 6), pady=3)
         ToolTip(info, tooltip)
 
     def clear_review_filters(self) -> None:
@@ -2169,16 +2996,29 @@ class MatcherApp:
         if percent is not None:
             self.progress_var.set(percent)
 
-    def pick_input_file(self) -> None:
+    def pick_input_file_t1(self) -> None:
         path = filedialog.askopenfilename(
-            title="Selecionar planilha de entrada",
+            title="Selecionar planilha Excel 1",
             filetypes=[("Excel", "*.xlsx *.xlsm *.xls")],
         )
         if path:
-            self.vars["input_file"].set(path)
+            self.vars["input_file_t1"].set(path)
+            self.refresh_sheet_choices()
             self.autofill_output_name()
             self.save_ui_state()
-            self.log(f"Planilha de entrada selecionada: {path}")
+            self.log(f"Planilha Excel 1 selecionada: {path}")
+
+    def pick_input_file_t2(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Selecionar planilha Excel 2",
+            filetypes=[("Excel", "*.xlsx *.xlsm *.xls")],
+        )
+        if path:
+            self.vars["input_file_t2"].set(path)
+            self.refresh_sheet_choices()
+            self.autofill_output_name()
+            self.save_ui_state()
+            self.log(f"Planilha Excel 2 selecionada: {path}")
 
     def pick_output_file(self) -> None:
         path = filedialog.asksaveasfilename(
@@ -2193,12 +3033,15 @@ class MatcherApp:
             self.log(f"Planilha de saída definida para: {path}")
 
     def autofill_output_name(self) -> None:
-        input_path = self.vars["input_file"].get().strip()
-        if not input_path:
+        input_t1 = self.vars["input_file_t1"].get().strip()
+        input_t2 = self.vars["input_file_t2"].get().strip()
+        if not input_t1 and not input_t2:
             self.vars["output_file"].set("resultado_matching.xlsx")
             return
-        path = Path(input_path)
-        self.vars["output_file"].set(str(path.with_name(f"{path.stem}_resultado_matching.xlsx")))
+        left = Path(input_t1).stem if input_t1 else "excel1"
+        right = Path(input_t2).stem if input_t2 else "excel2"
+        base_path = Path(input_t1 or input_t2)
+        self.vars["output_file"].set(str(base_path.with_name(f"{left}__{right}_resultado_matching.xlsx")))
 
     def collect_config_from_vars(self) -> dict[str, Any]:
         return {
@@ -2381,7 +3224,12 @@ class MatcherApp:
             f"Status da análise: {row['analysis_status']}",
             f"Método da análise: {row['analysis_method']}",
             f"T2 sugerido: {row['analysis_match_t2_original']}",
-            f"Pontuação sugerida: {row['analysis_score']}",
+            f"Pontuação sugerida (nome): {row['analysis_score']}",
+            f"Pontuação composta (nome + match2): {row.get('analysis_score_composite', '')}",
+            f"Match 2 T1: {row.get('analysis_match2_t1', '')}",
+            f"Match 2 T2: {row.get('analysis_match2_t2', '')}",
+            f"Match 2 prefixo igual: {row.get('analysis_match2_equal_prefix', False)}",
+            f"Match 2 score: {row.get('analysis_match2_score', '')}",
             f"Motivo da revisão: {row['analysis_review_reason']}",
             f"Sinalizadores de conflito: {row['final_conflict_flags']}",
         ]
@@ -2393,7 +3241,7 @@ class MatcherApp:
 
         candidates = self.analysis_result.candidates_df[
             self.analysis_result.candidates_df["source_row_id"] == source_row_id
-        ].sort_values(["rank", "score"], ascending=[True, False])
+        ].sort_values(["rank", "score_composite"], ascending=[True, False])
         for candidate in candidates.itertuples(index=False):
             quota_text = f"{getattr(candidate, 'quota_limit', '')}"
             candidate_tag = "ACEITO" if getattr(candidate, "rank") == 1 else ""
@@ -2404,7 +3252,7 @@ class MatcherApp:
                 values=(
                     getattr(candidate, "rank"),
                     getattr(candidate, "nome_t2_original"),
-                    getattr(candidate, "score"),
+                    getattr(candidate, "score_composite"),
                     getattr(candidate, "score_ordered_chars"),
                     getattr(candidate, "score_aligned_chars"),
                     "S" if getattr(candidate, "eligible_for_global") else "",
@@ -2446,7 +3294,7 @@ class MatcherApp:
         self.analysis_result.results_df.loc[row_mask, "manual_match_t2_original"] = candidate["nome_t2_original"]
         self.analysis_result.results_df.loc[row_mask, "manual_match_t2_norm"] = candidate["nome_t2_norm"]
         self.analysis_result.results_df.loc[row_mask, "manual_line_match_t2"] = candidate["excel_row_t2"]
-        self.analysis_result.results_df.loc[row_mask, "manual_score"] = candidate["score"]
+        self.analysis_result.results_df.loc[row_mask, "manual_score"] = candidate["score_composite"]
         self.analysis_result.results_df.loc[row_mask, "manual_note"] = self.manual_note_var.get().strip()
         self.analysis_result.results_df.loc[row_mask, "manual_sequence"] = self.manual_sequence
         recompute_final_state(self.analysis_result.results_df, self.catalog_df, config=self.analysis_result.config)
