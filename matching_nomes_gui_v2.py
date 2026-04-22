@@ -3080,7 +3080,7 @@ class MatcherApp:
                 self.root.after(0, lambda: self.on_analysis_success(result))
             except Exception as exc:
                 tb = traceback.format_exc()
-                self.root.after(0, lambda: self.on_background_error(str(exc), tb))
+                self.root.after(0, self.on_background_error, str(exc), tb)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -3443,7 +3443,7 @@ class MatcherApp:
                 self.root.after(0, lambda: self.on_export_success(output_path))
             except Exception as exc:
                 tb = traceback.format_exc()
-                self.root.after(0, lambda: self.on_background_error(str(exc), tb))
+                self.root.after(0, self.on_background_error, str(exc), tb)
 
         threading.Thread(target=worker, daemon=True).start()
 
