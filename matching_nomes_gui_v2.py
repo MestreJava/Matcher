@@ -35,6 +35,8 @@ except Exception:
 
 ProgressCallback = Callable[[str, float | None], None]
 APP_VERSION = "v2.1"
+REQUIRED_PYTHON_MAJOR = 3
+REQUIRED_PYTHON_MINOR = 12
 UI_STATE_FILE = Path.home() / ".matcher_matcher_ui_state.json"
 QUICK_PRESETS = {
     "Equilibrado": {
@@ -86,6 +88,23 @@ DEFAULT_MATCH_COLORS = {
     "color_no_match": "FFE57373",
     "color_excess_left": "FF64B5F6",
 }
+COLOR_NAME_TO_FILL = {
+    "Verde (Exato)": "FF4CAF50",
+    "Azul (Match aceito)": "FF2F80ED",
+    "Laranja (Revisão)": "FFF39C12",
+    "Vermelho (Sem match)": "FFE57373",
+    "Azul claro (Excedente Excel 1)": "FF64B5F6",
+}
+DEFAULT_MATCH_COLOR_LABELS = {
+    "color_exact": "Verde (Exato)",
+    "color_match": "Azul (Match aceito)",
+    "color_review": "Laranja (Revisão)",
+    "color_no_match": "Vermelho (Sem match)",
+    "color_excess_left": "Azul claro (Excedente Excel 1)",
+}
+MATCH_COLOR_KEYS = tuple(DEFAULT_MATCH_COLORS.keys())
+MATCH_COLOR_LABEL_OPTIONS = list(COLOR_NAME_TO_FILL.keys())
+COLOR_FILL_TO_LABEL = {fill: label for label, fill in COLOR_NAME_TO_FILL.items()}
 DEFAULT_SCORE_WEIGHTS = {
     "weight_token_set": 27.0,
     "weight_partial": 21.0,
@@ -127,6 +146,17 @@ class FlowEdge:
 def emit_progress(callback: ProgressCallback | None, message: str, percent: float | None = None) -> None:
     if callback:
         callback(message, percent)
+
+
+def ensure_supported_python_version() -> None:
+    current = (sys.version_info.major, sys.version_info.minor)
+    required = (REQUIRED_PYTHON_MAJOR, REQUIRED_PYTHON_MINOR)
+    if current != required:
+        current_text = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+        required_text = f"{REQUIRED_PYTHON_MAJOR}.{REQUIRED_PYTHON_MINOR}.x"
+        raise RuntimeError(
+            f"Versão de Python incompatível: {current_text}. Este programa exige Python {required_text}."
+        )
 
 
 def excel_col_to_index(col: str) -> int:
@@ -175,6 +205,22 @@ def safe_float(value: Any) -> float | None:
         return float(value)
     except Exception:
         return None
+
+
+def parse_bool(value: Any, field_name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if value in {0, 0.0}:
+            return False
+        if value in {1, 1.0}:
+            return True
+    text = str(value or "").strip().lower()
+    if text in {"1", "true", "t", "yes", "y", "sim", "s", "on"}:
+        return True
+    if text in {"0", "false", "f", "no", "n", "nao", "não", "off", ""}:
+        return False
+    raise ValueError(f"O campo '{field_name}' deve ser booleano (true/false). Valor recebido: {value!r}")
 
 
 def add_flag(flags: list[str], flag: str, enabled: bool) -> None:
@@ -470,23 +516,102 @@ def open_file_with_default_app(path: Path) -> None:
         subprocess.Popen(["xdg-open", str(path)])
 
 
-def list_workbook_sheets(file_path: str | Path) -> list[str]:
+@dataclass(frozen=True)
+class WorkbookMetadata:
+    file_path: Path
+    sheet_names: list[str]
+
+
+def list_workbook_sheets(file_path: str | Path, errors: list[str] | None = None) -> list[str]:
     path = Path(file_path)
     if not path.exists():
         return []
     try:
         return list(pd.ExcelFile(path).sheet_names)
-    except Exception:
+    except Exception as exc:
+        if errors is not None:
+            errors.append(
+                "Falha ao ler abas da planilha "
+                f"'{path}': {exc}. Verifique se o arquivo não está corrompido, bloqueado ou protegido."
+            )
         return []
 
 
+def read_workbook_metadata(file_path: str | Path, errors: list[str] | None = None) -> WorkbookMetadata:
+    path = Path(file_path)
+    sheet_names = list_workbook_sheets(path, errors=errors)
+    return WorkbookMetadata(file_path=path, sheet_names=sheet_names)
+
+
 def normalize_fill_color(value: Any, default: str) -> str:
-    text = str(value or "").strip().replace("#", "").upper()
-    if len(text) == 6:
-        return f"FF{text}"
-    if len(text) == 8:
+    resolved = resolve_fill_color(value)
+    if resolved:
+        return resolved
+    fallback = resolve_fill_color(default)
+    return fallback or "FF000000"
+
+
+def canonicalize_color_name(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    text = re.sub(r"[^a-z0-9]+", " ", text).strip()
+    return re.sub(r"\s+", " ", text)
+
+
+def build_color_alias_map() -> dict[str, str]:
+    aliases: dict[str, str] = {}
+    for label, fill_code in COLOR_NAME_TO_FILL.items():
+        aliases[canonicalize_color_name(label)] = fill_code
+
+    semantic_aliases = {
+        "exact": "Verde (Exato)",
+        "match": "Azul (Match aceito)",
+        "review": "Laranja (Revisão)",
+        "no match": "Vermelho (Sem match)",
+        "excess left": "Azul claro (Excedente Excel 1)",
+        "excedente excel 1": "Azul claro (Excedente Excel 1)",
+        "sem match": "Vermelho (Sem match)",
+        "revisao": "Laranja (Revisão)",
+        "aceito": "Azul (Match aceito)",
+        "exato": "Verde (Exato)",
+        "verde": "Verde (Exato)",
+        "azul": "Azul (Match aceito)",
+        "laranja": "Laranja (Revisão)",
+        "vermelho": "Vermelho (Sem match)",
+        "azul claro": "Azul claro (Excedente Excel 1)",
+    }
+    for alias, label in semantic_aliases.items():
+        aliases[canonicalize_color_name(alias)] = COLOR_NAME_TO_FILL[label]
+
+    for key, fill_code in DEFAULT_MATCH_COLORS.items():
+        aliases[canonicalize_color_name(key)] = fill_code
+    return aliases
+
+
+COLOR_ALIAS_TO_FILL = build_color_alias_map()
+
+
+def resolve_fill_color(value: Any) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    hex_candidate = text.replace("#", "").strip().upper()
+    if re.fullmatch(r"[0-9A-F]{6}", hex_candidate):
+        return f"FF{hex_candidate}"
+    if re.fullmatch(r"[0-9A-F]{8}", hex_candidate):
+        return hex_candidate
+    return COLOR_ALIAS_TO_FILL.get(canonicalize_color_name(text))
+
+
+def format_color_for_ui(value: Any, default_fill: str) -> str:
+    resolved = resolve_fill_color(value)
+    if resolved:
+        return COLOR_FILL_TO_LABEL.get(resolved, f"#{resolved[-6:]}")
+    text = str(value or "").strip()
+    if text:
         return text
-    return default
+    default_resolved = normalize_fill_color(default_fill, default_fill)
+    return COLOR_FILL_TO_LABEL.get(default_resolved, f"#{default_resolved[-6:]}")
 
 
 def parse_csv_columns(value: Any) -> list[str]:
@@ -504,6 +629,7 @@ def list_workbook_columns(
     file_path: str | Path,
     sheet_name: str,
     header_row: int,
+    errors: list[str] | None = None,
 ) -> list[str]:
     path = Path(file_path)
     if not path.exists():
@@ -517,7 +643,13 @@ def list_workbook_columns(
             nrows=0,
         )
         return [str(col) for col in preview_df.columns]
-    except Exception:
+    except Exception as exc:
+        if errors is not None:
+            errors.append(
+                "Falha ao ler colunas da planilha "
+                f"'{path}' (aba='{sheet_name}', cabeçalho={header_row}): {exc}. "
+                "Verifique se a aba/linha de cabeçalho está correta e se o arquivo está acessível."
+            )
         return []
 
 
@@ -585,7 +717,7 @@ def collect_workbook_preview(config: dict[str, Any]) -> str:
     return "\n".join(lines).strip()
 
 
-def validate_config(config: dict[str, Any], validate_workbook: bool = True) -> dict[str, Any]:
+def normalize_config_values(config: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(config)
     normalized["input_file_t1"] = str(Path(normalized["input_file_t1"]).expanduser())
     normalized["input_file_t2"] = str(Path(normalized["input_file_t2"]).expanduser())
@@ -619,8 +751,8 @@ def validate_config(config: dict[str, Any], validate_workbook: bool = True) -> d
     normalized["missing_surname_penalty"] = float(normalized.get("missing_surname_penalty", 3.0))
     normalized["match2_prefix_chars"] = int(normalized.get("match2_prefix_chars", 8) or 8)
     normalized["match2_weight"] = float(normalized.get("match2_weight", 0.2) or 0.2)
-    normalized["allow_reuse_t2_matches"] = bool(normalized["allow_reuse_t2_matches"])
-    normalized["auto_open_output"] = bool(normalized["auto_open_output"])
+    normalized["allow_reuse_t2_matches"] = parse_bool(normalized["allow_reuse_t2_matches"], "allow_reuse_t2_matches")
+    normalized["auto_open_output"] = parse_bool(normalized["auto_open_output"], "auto_open_output")
     normalized["match2_col_t1"] = str(normalized.get("match2_col_t1", "") or "").strip().upper()
     normalized["match2_col_t2"] = str(normalized.get("match2_col_t2", "") or "").strip().upper()
     normalized["tab4_extra_cols_t1"] = serialize_csv_columns(parse_csv_columns(normalized.get("tab4_extra_cols_t1", "")))
@@ -629,7 +761,10 @@ def validate_config(config: dict[str, Any], validate_workbook: bool = True) -> d
         normalized[key] = float(normalized.get(key, default_value))
     for key, default_value in DEFAULT_MATCH_COLORS.items():
         normalized[key] = normalize_fill_color(normalized.get(key), default_value)
+    return normalized
 
+
+def validate_config_thresholds_and_columns(normalized: dict[str, Any]) -> None:
     if normalized["header_row_t1"] <= 0 or normalized["header_row_t2"] <= 0:
         raise ValueError("As linhas de cabeçalho devem ser maiores que zero.")
     if normalized["max_external_chars"] <= 0:
@@ -664,33 +799,56 @@ def validate_config(config: dict[str, Any], validate_workbook: bool = True) -> d
     if normalized["match2_col_t2"]:
         excel_col_to_index(normalized["match2_col_t2"])
 
+
+def validate_config_workbook_metadata(normalized: dict[str, Any]) -> None:
+    file_t1 = Path(normalized["input_file_t1"])
+    file_t2 = Path(normalized["input_file_t2"])
+    if not file_t1.exists():
+        raise FileNotFoundError(f"Arquivo de entrada não encontrado: {file_t1}")
+    if not file_t2.exists():
+        raise FileNotFoundError(f"Arquivo de entrada não encontrado: {file_t2}")
+    metadata_errors: list[str] = []
+    metadata_t1 = read_workbook_metadata(file_t1, errors=metadata_errors)
+    metadata_t2 = read_workbook_metadata(file_t2, errors=metadata_errors)
+    if metadata_errors:
+        raise ValueError("\n".join(metadata_errors))
+    if normalized["sheet_t1"] not in metadata_t1.sheet_names:
+        raise ValueError(f"Aba ausente no Excel 1: {normalized['sheet_t1']}")
+    if normalized["sheet_t2"] not in metadata_t2.sheet_names:
+        raise ValueError(f"Aba ausente no Excel 2: {normalized['sheet_t2']}")
+    headers_t1 = list_workbook_columns(
+        metadata_t1.file_path,
+        normalized["sheet_t1"],
+        normalized["header_row_t1"],
+        errors=metadata_errors,
+    )
+    headers_t2 = list_workbook_columns(
+        metadata_t2.file_path,
+        normalized["sheet_t2"],
+        normalized["header_row_t2"],
+        errors=metadata_errors,
+    )
+    if metadata_errors:
+        raise ValueError("\n".join(metadata_errors))
+    if normalized["match2_col_t1"] and excel_col_to_index(normalized["match2_col_t1"]) >= len(headers_t1):
+        raise ValueError(f"Coluna match 2 inválida no Excel 1: {normalized['match2_col_t1']}")
+    if normalized["match2_col_t2"] and excel_col_to_index(normalized["match2_col_t2"]) >= len(headers_t2):
+        raise ValueError(f"Coluna match 2 inválida no Excel 2: {normalized['match2_col_t2']}")
+    extras_t1 = parse_csv_columns(normalized["tab4_extra_cols_t1"])
+    extras_t2 = parse_csv_columns(normalized["tab4_extra_cols_t2"])
+    missing_t1 = [col for col in extras_t1 if col not in headers_t1]
+    missing_t2 = [col for col in extras_t2 if col not in headers_t2]
+    if missing_t1:
+        raise ValueError(f"Coluna(s) extra(s) da aba 4 ausente(s) no Excel 1: {', '.join(missing_t1)}")
+    if missing_t2:
+        raise ValueError(f"Coluna(s) extra(s) da aba 4 ausente(s) no Excel 2: {', '.join(missing_t2)}")
+
+
+def validate_config(config: dict[str, Any], validate_workbook: bool = True) -> dict[str, Any]:
+    normalized = normalize_config_values(config)
+    validate_config_thresholds_and_columns(normalized)
     if validate_workbook:
-        file_t1 = Path(normalized["input_file_t1"])
-        file_t2 = Path(normalized["input_file_t2"])
-        if not file_t1.exists():
-            raise FileNotFoundError(f"Arquivo de entrada não encontrado: {file_t1}")
-        if not file_t2.exists():
-            raise FileNotFoundError(f"Arquivo de entrada não encontrado: {file_t2}")
-        sheets_t1 = pd.ExcelFile(file_t1).sheet_names
-        sheets_t2 = pd.ExcelFile(file_t2).sheet_names
-        if normalized["sheet_t1"] not in sheets_t1:
-            raise ValueError(f"Aba ausente no Excel 1: {normalized['sheet_t1']}")
-        if normalized["sheet_t2"] not in sheets_t2:
-            raise ValueError(f"Aba ausente no Excel 2: {normalized['sheet_t2']}")
-        headers_t1 = list_workbook_columns(file_t1, normalized["sheet_t1"], normalized["header_row_t1"])
-        headers_t2 = list_workbook_columns(file_t2, normalized["sheet_t2"], normalized["header_row_t2"])
-        if normalized["match2_col_t1"] and excel_col_to_index(normalized["match2_col_t1"]) >= len(headers_t1):
-            raise ValueError(f"Coluna match 2 inválida no Excel 1: {normalized['match2_col_t1']}")
-        if normalized["match2_col_t2"] and excel_col_to_index(normalized["match2_col_t2"]) >= len(headers_t2):
-            raise ValueError(f"Coluna match 2 inválida no Excel 2: {normalized['match2_col_t2']}")
-        extras_t1 = parse_csv_columns(normalized["tab4_extra_cols_t1"])
-        extras_t2 = parse_csv_columns(normalized["tab4_extra_cols_t2"])
-        missing_t1 = [col for col in extras_t1 if col not in headers_t1]
-        missing_t2 = [col for col in extras_t2 if col not in headers_t2]
-        if missing_t1:
-            raise ValueError(f"Coluna(s) extra(s) da aba 4 ausente(s) no Excel 1: {', '.join(missing_t1)}")
-        if missing_t2:
-            raise ValueError(f"Coluna(s) extra(s) da aba 4 ausente(s) no Excel 2: {', '.join(missing_t2)}")
+        validate_config_workbook_metadata(normalized)
 
     return normalized
 
@@ -787,7 +945,7 @@ def build_target_catalog(df2: pd.DataFrame, config: dict[str, Any]) -> tuple[pd.
     )
     grouped = grouped.rename(columns={"nome_t2_match_norm": "nome_t2_norm"})
     if config["allow_reuse_t2_matches"]:
-        grouped["quota_limit"] = grouped["quota_original"].apply(lambda count: max(int(count), config["max_matches_per_t2_name"]))
+        grouped["quota_limit"] = int(config["max_matches_per_t2_name"])
     else:
         grouped["quota_limit"] = grouped["quota_original"]
 
@@ -1591,6 +1749,12 @@ def export_analysis_result(
 
 
 def build_export_catalog(result: AnalysisResult) -> pd.DataFrame:
+    """Return a safe copy of the export catalog.
+
+    This helper is kept as a supported programmatic entry point for
+    external scripts/integrations. It is intentionally retained even if
+    in-repo callers are not present.
+    """
     if result.catalog_df.empty:
         columns = ["nome_t2_norm", "nome_t2_original", "quota_original", "quota_limit", "excel_row_t2"]
         return pd.DataFrame(columns=columns)
@@ -1890,6 +2054,13 @@ def build_grouped_reconciliation_df(result: AnalysisResult) -> pd.DataFrame:
 
 
 def run_matching(config: dict[str, Any], progress_callback: ProgressCallback | None = None) -> Path:
+    """Run full analysis + export pipeline.
+
+    This helper is kept as a supported programmatic entry point for
+    external scripts/integrations. It is intentionally retained even if
+    in-repo callers are not present.
+    """
+    ensure_supported_python_version()
     result = analyze_matching(config, progress_callback=progress_callback)
     return export_analysis_result(result, progress_callback=progress_callback)
 
@@ -1945,6 +2116,8 @@ class MatcherApp:
         self.catalog_df: pd.DataFrame = pd.DataFrame()
         self.manual_sequence = 0
         self.last_manual_actions: list[str] = []
+        self.busy_operation: str | None = None
+        self._last_workbook_metadata_error: str = ""
 
         self.vars: dict[str, tk.Variable] = {
             "input_file_t1": tk.StringVar(),
@@ -1964,11 +2137,11 @@ class MatcherApp:
             "tab4_extra_cols_t2": tk.StringVar(value=""),
             "output_mode": tk.StringVar(value="enxuta"),
             "quantity_resolution_mode": tk.StringVar(value="marcar_excedente_excel1"),
-            "color_exact": tk.StringVar(value=DEFAULT_MATCH_COLORS["color_exact"]),
-            "color_match": tk.StringVar(value=DEFAULT_MATCH_COLORS["color_match"]),
-            "color_review": tk.StringVar(value=DEFAULT_MATCH_COLORS["color_review"]),
-            "color_no_match": tk.StringVar(value=DEFAULT_MATCH_COLORS["color_no_match"]),
-            "color_excess_left": tk.StringVar(value=DEFAULT_MATCH_COLORS["color_excess_left"]),
+            "color_exact": tk.StringVar(value=DEFAULT_MATCH_COLOR_LABELS["color_exact"]),
+            "color_match": tk.StringVar(value=DEFAULT_MATCH_COLOR_LABELS["color_match"]),
+            "color_review": tk.StringVar(value=DEFAULT_MATCH_COLOR_LABELS["color_review"]),
+            "color_no_match": tk.StringVar(value=DEFAULT_MATCH_COLOR_LABELS["color_no_match"]),
+            "color_excess_left": tk.StringVar(value=DEFAULT_MATCH_COLOR_LABELS["color_excess_left"]),
             "max_external_chars": tk.StringVar(value="30"),
             "accept_score": tk.StringVar(value="92"),
             "review_score": tk.StringVar(value="85"),
@@ -2431,6 +2604,8 @@ class MatcherApp:
                     variable.set(value)
             if legacy_input and not self.vars["input_file_t1"].get():
                 self.vars["input_file_t1"].set(legacy_input)
+            for key in MATCH_COLOR_KEYS:
+                self.normalize_color_var_value(key)
             self.quick_preset_var.set(payload.get("quick_preset", self.quick_preset_var.get()))
             self.config_mode_var.set(payload.get("config_mode", self.config_mode_var.get()))
             self.review_filter_var.set(payload.get("review_filter", self.review_filter_var.get()))
@@ -2779,14 +2954,24 @@ class MatcherApp:
         note_frame = ttk.Frame(detail_content)
         note_frame.pack(fill="x", pady=(0, 8))
         ttk.Label(note_frame, text="Observação manual").pack(side="left")
-        ttk.Entry(note_frame, textvariable=self.manual_note_var).pack(side="left", fill="x", expand=True, padx=(8, 0))
+        self.manual_note_entry = ttk.Entry(note_frame, textvariable=self.manual_note_var)
+        self.manual_note_entry.pack(side="left", fill="x", expand=True, padx=(8, 0))
 
         buttons = ttk.Frame(detail_content)
         buttons.pack(fill="x")
-        ttk.Button(buttons, text="Aceitar candidato selecionado", command=self.accept_selected_candidate, style="Success.TButton").pack(side="left")
-        ttk.Button(buttons, text="Marcar sem match", command=self.mark_selected_no_match, style="Danger.TButton").pack(side="left", padx=8)
-        ttk.Button(buttons, text="Manter em revisão", command=self.keep_selected_in_review, style="Warning.TButton").pack(side="left")
-        ttk.Button(buttons, text="Resetar decisão manual", command=self.reset_manual_decision, style="Info.TButton").pack(side="left", padx=8)
+        self.review_action_buttons: list[ttk.Button] = []
+        accept_button = ttk.Button(buttons, text="Aceitar candidato selecionado", command=self.accept_selected_candidate, style="Success.TButton")
+        accept_button.pack(side="left")
+        self.review_action_buttons.append(accept_button)
+        no_match_button = ttk.Button(buttons, text="Marcar sem match", command=self.mark_selected_no_match, style="Danger.TButton")
+        no_match_button.pack(side="left", padx=8)
+        self.review_action_buttons.append(no_match_button)
+        keep_review_button = ttk.Button(buttons, text="Manter em revisão", command=self.keep_selected_in_review, style="Warning.TButton")
+        keep_review_button.pack(side="left")
+        self.review_action_buttons.append(keep_review_button)
+        reset_button = ttk.Button(buttons, text="Resetar decisão manual", command=self.reset_manual_decision, style="Info.TButton")
+        reset_button.pack(side="left", padx=8)
+        self.review_action_buttons.append(reset_button)
 
     def _build_export_tab(self) -> None:
         actions = ttk.Frame(self.tab_export)
@@ -2869,13 +3054,29 @@ class MatcherApp:
         ttk.Label(parent, text=label).grid(row=row, column=col, sticky="w", padx=4, pady=3)
         frame = ttk.Frame(parent)
         frame.grid(row=row, column=col + 1, sticky="ew", padx=4, pady=3)
-        ttk.Entry(frame, textvariable=self.vars[var_key], width=16).pack(side="left", fill="x", expand=True)
+        combo = ttk.Combobox(
+            frame,
+            textvariable=self.vars[var_key],
+            values=MATCH_COLOR_LABEL_OPTIONS,
+            width=24,
+        )
+        combo.pack(side="left", fill="x", expand=True)
+        combo.bind("<<ComboboxSelected>>", lambda _event, key=var_key: self.normalize_color_var_value(key, save_state=True))
+        combo.bind("<FocusOut>", lambda _event, key=var_key: self.normalize_color_var_value(key))
         ttk.Button(
             frame,
             text="Cor...",
             command=lambda key=var_key: self.choose_color(key),
             style="Primary.TButton",
         ).pack(side="left", padx=(6, 0))
+
+    def normalize_color_var_value(self, var_key: str, save_state: bool = False) -> None:
+        current = str(self.vars[var_key].get() or "").strip()
+        formatted = format_color_for_ui(current, DEFAULT_MATCH_COLORS[var_key])
+        if formatted != current:
+            self.vars[var_key].set(formatted)
+        if save_state:
+            self.save_ui_state()
 
     def _add_csv_column_field(
         self,
@@ -2912,7 +3113,7 @@ class MatcherApp:
         color = f"#{normalize_fill_color(current, DEFAULT_MATCH_COLORS[var_key])[-6:]}"
         chosen = colorchooser.askcolor(color=color, title=f"Escolher cor para {var_key}")
         if chosen and chosen[1]:
-            self.vars[var_key].set(normalize_fill_color(chosen[1], DEFAULT_MATCH_COLORS[var_key]))
+            self.vars[var_key].set(format_color_for_ui(chosen[1], DEFAULT_MATCH_COLORS[var_key]))
             self.save_ui_state()
 
     def apply_tab4_default_columns(self, var_key: str, side: str) -> None:
@@ -2936,8 +3137,9 @@ class MatcherApp:
         self.apply_tab4_default_columns(var_key, side)
 
     def refresh_sheet_choices(self) -> None:
-        self.sheet_options_t1 = list_workbook_sheets(self.vars["input_file_t1"].get())
-        self.sheet_options_t2 = list_workbook_sheets(self.vars["input_file_t2"].get())
+        metadata_errors: list[str] = []
+        self.sheet_options_t1 = list_workbook_sheets(self.vars["input_file_t1"].get(), errors=metadata_errors)
+        self.sheet_options_t2 = list_workbook_sheets(self.vars["input_file_t2"].get(), errors=metadata_errors)
         if hasattr(self, "sheet_t1_combo"):
             self.sheet_t1_combo["values"] = self.sheet_options_t1
         if hasattr(self, "sheet_t2_combo"):
@@ -2958,8 +3160,28 @@ class MatcherApp:
             header_t2 = int(self.vars["header_row_t2"].get() or 1)
         except ValueError:
             header_t2 = 1
-        self.column_options_t1 = list_workbook_columns(self.vars["input_file_t1"].get(), self.vars["sheet_t1"].get(), header_t1)
-        self.column_options_t2 = list_workbook_columns(self.vars["input_file_t2"].get(), self.vars["sheet_t2"].get(), header_t2)
+        self.column_options_t1 = list_workbook_columns(
+            self.vars["input_file_t1"].get(),
+            self.vars["sheet_t1"].get(),
+            header_t1,
+            errors=metadata_errors,
+        )
+        self.column_options_t2 = list_workbook_columns(
+            self.vars["input_file_t2"].get(),
+            self.vars["sheet_t2"].get(),
+            header_t2,
+            errors=metadata_errors,
+        )
+        if metadata_errors:
+            signature = " | ".join(metadata_errors)
+            if signature != self._last_workbook_metadata_error:
+                self.log("Falha ao carregar metadados das planilhas:")
+                for message in metadata_errors:
+                    self.log(f"- {message}")
+                self.set_status("Falha ao ler metadados da planilha. Verifique o log para detalhes.", None)
+                self._last_workbook_metadata_error = signature
+        else:
+            self._last_workbook_metadata_error = ""
         self.apply_tab4_default_columns("tab4_extra_cols_t1", "t1")
         self.apply_tab4_default_columns("tab4_extra_cols_t2", "t2")
 
@@ -3070,7 +3292,7 @@ class MatcherApp:
             self._show_error("Erro de validação", str(exc))
             return
 
-        self.set_busy(True)
+        self.set_busy(True, operation="analysis")
         self.set_status("Iniciando análise...", 0)
         self.log("Iniciando análise.")
 
@@ -3091,10 +3313,25 @@ class MatcherApp:
         self.set_status(message, percent)
         self.log(message)
 
-    def set_busy(self, is_busy: bool) -> None:
+    def set_busy(self, is_busy: bool, operation: str | None = None) -> None:
+        if is_busy:
+            self.busy_operation = operation or "background"
+        else:
+            self.busy_operation = None
         state = "disabled" if is_busy else "normal"
         self.analyze_button.config(state=state)
         self.export_button.config(state=state)
+        review_controls_state = "disabled" if is_busy and self.busy_operation == "export" else "normal"
+        for button in getattr(self, "review_action_buttons", []):
+            button.config(state=review_controls_state)
+        if hasattr(self, "manual_note_entry"):
+            self.manual_note_entry.config(state=review_controls_state)
+
+    def _ensure_review_mutation_allowed(self) -> bool:
+        if self.busy_operation == "export":
+            self._show_warning("Exportação em andamento", "Aguarde o fim da exportação para alterar decisões manuais.")
+            return False
+        return True
 
     def on_analysis_success(self, result: AnalysisResult) -> None:
         self.analysis_result = result
@@ -3272,6 +3509,8 @@ class MatcherApp:
     def accept_selected_candidate(self) -> None:
         if self.analysis_result is None:
             return
+        if not self._ensure_review_mutation_allowed():
+            return
         source_row_id = self._selected_source_row_id()
         if source_row_id is None:
             return
@@ -3308,6 +3547,8 @@ class MatcherApp:
     def mark_selected_no_match(self) -> None:
         if self.analysis_result is None:
             return
+        if not self._ensure_review_mutation_allowed():
+            return
         source_row_id = self._selected_source_row_id()
         if source_row_id is None:
             return
@@ -3331,6 +3572,8 @@ class MatcherApp:
     def keep_selected_in_review(self) -> None:
         if self.analysis_result is None:
             return
+        if not self._ensure_review_mutation_allowed():
+            return
         source_row_id = self._selected_source_row_id()
         if source_row_id is None:
             return
@@ -3349,6 +3592,8 @@ class MatcherApp:
 
     def reset_manual_decision(self) -> None:
         if self.analysis_result is None:
+            return
+        if not self._ensure_review_mutation_allowed():
             return
         source_row_id = self._selected_source_row_id()
         if source_row_id is None:
@@ -3429,7 +3674,7 @@ class MatcherApp:
             self._show_error("Validação da exportação", str(exc))
             return
 
-        self.set_busy(True)
+        self.set_busy(True, operation="export")
         self.set_status("Exportando planilha...", 0)
         self.log("Iniciando exportação.")
 
@@ -3474,6 +3719,7 @@ class MatcherApp:
 
 
 def main() -> None:
+    ensure_supported_python_version()
     root = ttk.Window(themename="darkly") if HAS_TTKBOOTSTRAP else tk.Tk()
     try:
         root.iconbitmap(default="")

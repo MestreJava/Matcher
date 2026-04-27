@@ -1,0 +1,11 @@
+- [x] Reuse limit logic behaves as a cap and matches UI wording.
+- [x] Config boolean parsing is explicit and safe for string/bool inputs.
+- [x] Export cannot run concurrently with manual review mutations.
+- [x] Workbook metadata errors are visible to users with actionable context.
+- [x] GUI color configuration shows readable color names/labels instead of raw fill literals.
+- [x] Export formatting still produces valid workbook fill colors from named settings.
+- [x] Backward compatibility is preserved for previously saved UI state color values.
+- [x] Any removed helper has confirmed no usage; uncertain items remain documented, not deleted.
+- [x] Matching analysis smoke run succeeds with sample workbook.
+- [x] Export smoke run succeeds with sample workbook and expected sheets.
+- [x] README reflects new color configuration behavior and any user-visible changes.
