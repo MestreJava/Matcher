@@ -423,6 +423,8 @@ def format_output_workbook(output_file: Path, result: AnalysisResult, results_st
 
     source_bucket_by_row = result.results_df.set_index("source_row_id")["final_color_bucket"].fillna("").to_dict()
     target_row_map = result.target_df.set_index("excel_row_t2")["target_row_id"].to_dict() if not result.target_df.empty else {}
+    money_cols_t1 = parse_csv_columns(result.config.get("tab4_money_cols_t1", ""))
+    money_cols_t2 = parse_csv_columns(result.config.get("tab4_money_cols_t2", ""))
     target_bucket_by_row_id: dict[int, str] = {
         int(row_id): "NO_MATCH" for row_id in result.target_df["target_row_id"].tolist()
     } if not result.target_df.empty else {}
@@ -500,6 +502,15 @@ def format_output_workbook(output_file: Path, result: AnalysisResult, results_st
                     ws.cell(row=row_number, column=1).fill = fills.get(str(row["_bucket_left"]), PatternFill())
                 if row.get("_bucket_right"):
                     ws.cell(row=row_number, column=2).fill = fills.get(str(row["_bucket_right"]), PatternFill())
+            money_headers = [f"E1:{column}" for column in money_cols_t1] + [f"E2:{column}" for column in money_cols_t2]
+            for header_name in money_headers:
+                header_index = _find_header_index(ws, header_name)
+                if header_index is None:
+                    continue
+                for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+                    cell = row[header_index - 1]
+                    if isinstance(cell.value, (int, float)) and not isinstance(cell.value, bool):
+                        cell.number_format = 'R$ #,##0.00;[Red]-R$ #,##0.00'
         ws.auto_filter.ref = ws.dimensions
         _autosize_columns(ws)
 
@@ -625,6 +636,49 @@ def serialize_csv_columns(columns: list[str]) -> str:
     return ", ".join([str(column).strip() for column in columns if str(column).strip()])
 
 
+def parse_brl_currency_value(value: Any) -> float | None:
+    if value is None or pd.isna(value):
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    negative = False
+    if text.startswith("(") and text.endswith(")"):
+        negative = True
+        text = text[1:-1].strip()
+
+    text = text.replace("R$", "").replace("\xa0", " ")
+    text = re.sub(r"\s+", "", text)
+    text = re.sub(r"[^0-9,.\-]", "", text)
+    if not text:
+        return None
+
+    if text.count("-") > 1:
+        return None
+    if "-" in text:
+        if text.startswith("-"):
+            negative = True
+            text = text[1:]
+        else:
+            return None
+    if not text:
+        return None
+
+    if "," in text:
+        text = text.replace(".", "")
+        text = text.replace(",", ".")
+
+    try:
+        numeric = float(text)
+    except ValueError:
+        return None
+    return -numeric if negative else numeric
+
+
 def list_workbook_columns(
     file_path: str | Path,
     sheet_name: str,
@@ -714,6 +768,9 @@ def collect_workbook_preview(config: dict[str, Any]) -> str:
     lines.append(
         f"Extras aba 4 E1: {config.get('tab4_extra_cols_t1', '') or '(nenhum)'} | E2: {config.get('tab4_extra_cols_t2', '') or '(nenhum)'}"
     )
+    lines.append(
+        f"Monetárias aba 4 E1: {config.get('tab4_money_cols_t1', '') or '(nenhum)'} | E2: {config.get('tab4_money_cols_t2', '') or '(nenhum)'}"
+    )
     return "\n".join(lines).strip()
 
 
@@ -757,6 +814,8 @@ def normalize_config_values(config: dict[str, Any]) -> dict[str, Any]:
     normalized["match2_col_t2"] = str(normalized.get("match2_col_t2", "") or "").strip().upper()
     normalized["tab4_extra_cols_t1"] = serialize_csv_columns(parse_csv_columns(normalized.get("tab4_extra_cols_t1", "")))
     normalized["tab4_extra_cols_t2"] = serialize_csv_columns(parse_csv_columns(normalized.get("tab4_extra_cols_t2", "")))
+    normalized["tab4_money_cols_t1"] = serialize_csv_columns(parse_csv_columns(normalized.get("tab4_money_cols_t1", "")))
+    normalized["tab4_money_cols_t2"] = serialize_csv_columns(parse_csv_columns(normalized.get("tab4_money_cols_t2", "")))
     for key, default_value in DEFAULT_SCORE_WEIGHTS.items():
         normalized[key] = float(normalized.get(key, default_value))
     for key, default_value in DEFAULT_MATCH_COLORS.items():
@@ -836,12 +895,32 @@ def validate_config_workbook_metadata(normalized: dict[str, Any]) -> None:
         raise ValueError(f"Coluna match 2 inválida no Excel 2: {normalized['match2_col_t2']}")
     extras_t1 = parse_csv_columns(normalized["tab4_extra_cols_t1"])
     extras_t2 = parse_csv_columns(normalized["tab4_extra_cols_t2"])
+    money_t1 = parse_csv_columns(normalized["tab4_money_cols_t1"])
+    money_t2 = parse_csv_columns(normalized["tab4_money_cols_t2"])
     missing_t1 = [col for col in extras_t1 if col not in headers_t1]
     missing_t2 = [col for col in extras_t2 if col not in headers_t2]
+    missing_money_t1 = [col for col in money_t1 if col not in headers_t1]
+    missing_money_t2 = [col for col in money_t2 if col not in headers_t2]
+    missing_money_in_extras_t1 = [col for col in money_t1 if col not in extras_t1]
+    missing_money_in_extras_t2 = [col for col in money_t2 if col not in extras_t2]
     if missing_t1:
         raise ValueError(f"Coluna(s) extra(s) da aba 4 ausente(s) no Excel 1: {', '.join(missing_t1)}")
     if missing_t2:
         raise ValueError(f"Coluna(s) extra(s) da aba 4 ausente(s) no Excel 2: {', '.join(missing_t2)}")
+    if missing_money_t1:
+        raise ValueError(f"Coluna(s) monetária(s) da aba 4 ausente(s) no Excel 1: {', '.join(missing_money_t1)}")
+    if missing_money_t2:
+        raise ValueError(f"Coluna(s) monetária(s) da aba 4 ausente(s) no Excel 2: {', '.join(missing_money_t2)}")
+    if missing_money_in_extras_t1:
+        raise ValueError(
+            "Coluna(s) monetária(s) da aba 4 no Excel 1 devem também estar em Extras aba 4: "
+            + ", ".join(missing_money_in_extras_t1)
+        )
+    if missing_money_in_extras_t2:
+        raise ValueError(
+            "Coluna(s) monetária(s) da aba 4 no Excel 2 devem também estar em Extras aba 4: "
+            + ", ".join(missing_money_in_extras_t2)
+        )
 
 
 def validate_config(config: dict[str, Any], validate_workbook: bool = True) -> dict[str, Any]:
@@ -1979,6 +2058,8 @@ def build_grouped_reconciliation_df(result: AnalysisResult) -> pd.DataFrame:
     result_records = results_df.to_dict("records")
     extra_cols_t1 = parse_csv_columns(result.config.get("tab4_extra_cols_t1", ""))
     extra_cols_t2 = parse_csv_columns(result.config.get("tab4_extra_cols_t2", ""))
+    money_cols_t1 = set(parse_csv_columns(result.config.get("tab4_money_cols_t1", "")))
+    money_cols_t2 = set(parse_csv_columns(result.config.get("tab4_money_cols_t2", "")))
     if result.config.get("match2_col_t1"):
         source_match2_col_index = excel_col_to_index(result.config["match2_col_t1"])
         source_original = extract_original_columns(result.source_df, "source_row_id")
@@ -2039,13 +2120,23 @@ def build_grouped_reconciliation_df(result: AnalysisResult) -> pd.DataFrame:
             if left:
                 source_info = source_records_by_id.get(int(left.get("source_row_id", 0)), {})
                 for column in extra_cols_t1:
-                    rows[-1][f"E1:{column}"] = str(source_info.get(column, "") or "")
+                    raw_value = source_info.get(column, "")
+                    if column in money_cols_t1:
+                        numeric_value = parse_brl_currency_value(raw_value)
+                        rows[-1][f"E1:{column}"] = numeric_value if numeric_value is not None else str(raw_value or "")
+                    else:
+                        rows[-1][f"E1:{column}"] = str(raw_value or "")
             else:
                 for column in extra_cols_t1:
                     rows[-1][f"E1:{column}"] = ""
             if right:
                 for column in extra_cols_t2:
-                    rows[-1][f"E2:{column}"] = str(right.get(column, "") or "")
+                    raw_value = right.get(column, "")
+                    if column in money_cols_t2:
+                        numeric_value = parse_brl_currency_value(raw_value)
+                        rows[-1][f"E2:{column}"] = numeric_value if numeric_value is not None else str(raw_value or "")
+                    else:
+                        rows[-1][f"E2:{column}"] = str(raw_value or "")
             else:
                 for column in extra_cols_t2:
                     rows[-1][f"E2:{column}"] = ""
@@ -2135,6 +2226,8 @@ class MatcherApp:
             "match2_weight": tk.StringVar(value="0.2"),
             "tab4_extra_cols_t1": tk.StringVar(value=""),
             "tab4_extra_cols_t2": tk.StringVar(value=""),
+            "tab4_money_cols_t1": tk.StringVar(value=""),
+            "tab4_money_cols_t2": tk.StringVar(value=""),
             "output_mode": tk.StringVar(value="enxuta"),
             "quantity_resolution_mode": tk.StringVar(value="marcar_excedente_excel1"),
             "color_exact": tk.StringVar(value=DEFAULT_MATCH_COLOR_LABELS["color_exact"]),
@@ -2698,6 +2791,24 @@ class MatcherApp:
             "Extras aba 4 (Excel 2)",
             "tab4_extra_cols_t2",
             "Colunas extras exibidas na aba 4 para Excel 2 (separadas por vírgula).",
+            side="t2",
+        )
+        self._add_csv_column_field(
+            output_frame,
+            5,
+            0,
+            "Monetárias aba 4 (Excel 1)",
+            "tab4_money_cols_t1",
+            "Colunas da aba 4 do Excel 1 que devem ser exportadas como moeda (R$). Aceita valores simples e textos com R$. A coluna também precisa estar em Extras aba 4.",
+            side="t1",
+        )
+        self._add_csv_column_field(
+            output_frame,
+            5,
+            3,
+            "Monetárias aba 4 (Excel 2)",
+            "tab4_money_cols_t2",
+            "Colunas da aba 4 do Excel 2 que devem ser exportadas como moeda (R$). Aceita valores simples e textos com R$. A coluna também precisa estar em Extras aba 4.",
             side="t2",
         )
         output_frame.columnconfigure(1, weight=1)
