@@ -1,4 +1,8 @@
+<<<<<<< HEAD
 ﻿﻿﻿﻿# STRICT PYTHON VERSION: 3.12.x
+=======
+# STRICT PYTHON VERSION: 3.12.x
+>>>>>>> 230254f0e6dc86446e119dbee6830fafa088d0dd
 pandas==3.0.2
 openpyxl==3.1.5
 RapidFuzz==3.14.3
