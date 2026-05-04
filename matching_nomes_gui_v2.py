@@ -10,6 +10,7 @@ import traceback
 import unicodedata
 from collections import defaultdict, deque
 from dataclasses import dataclass
+from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Callable
@@ -223,6 +224,56 @@ def parse_bool(value: Any, field_name: str) -> bool:
     raise ValueError(f"O campo '{field_name}' deve ser booleano (true/false). Valor recebido: {value!r}")
 
 
+DATE_DDMMYYYY_RE = re.compile(r"^\d{2}/\d{2}/\d{4}$")
+DATE_DDMMYYYY_TIME_RE = re.compile(r"^\d{2}/\d{2}/\d{4}(?:[ T]\d{2}:\d{2}(?::\d{2})?)?$")
+DATE_ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?)?$")
+
+
+def parse_date_prefer_ddmmyyyy(value: Any) -> pd.Timestamp | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, pd.Timestamp):
+        return value
+    if isinstance(value, datetime):
+        return pd.Timestamp(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    normalized = text.replace("T", " ")
+    for fmt in ("%d/%m/%Y", "%d/%m/%Y %H:%M", "%d/%m/%Y %H:%M:%S"):
+        try:
+            return pd.Timestamp(datetime.strptime(normalized, fmt))
+        except ValueError:
+            pass
+    for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
+        try:
+            return pd.Timestamp(datetime.strptime(normalized, fmt))
+        except ValueError:
+            pass
+    if DATE_DDMMYYYY_TIME_RE.fullmatch(normalized):
+        return None
+    if "/" in normalized:
+        return None
+    parsed = pd.to_datetime(normalized, errors="coerce")
+    if pd.isna(parsed):
+        return None
+    return pd.Timestamp(parsed)
+
+
+def normalize_date_ddmmyyyy(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    parsed = parse_date_prefer_ddmmyyyy(text)
+    if parsed is None:
+        return text.upper()
+    return parsed.strftime("%d/%m/%Y")
+
+
+def is_ddmmyyyy(text: str) -> bool:
+    return bool(DATE_DDMMYYYY_RE.fullmatch(str(text or "").strip()))
+
+
 def add_flag(flags: list[str], flag: str, enabled: bool) -> None:
     if enabled and flag not in flags:
         flags.append(flag)
@@ -273,34 +324,76 @@ def score_candidate(
     match2_prefix_chars: int = 8,
     match2_weight: float = 0.2,
     config: dict[str, Any] | None = None,
+    metrics_cache: dict[tuple[str, str], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    full_tokens = token_set(full_name)
-    ext_tokens = token_set(external_name)
+    cache_key = (full_name, external_name)
+    cached = metrics_cache.get(cache_key) if metrics_cache is not None else None
+    if cached is None:
+        full_tokens = token_set(full_name)
+        ext_tokens = token_set(external_name)
+        same_first = first_token(full_name) == first_token(external_name) and first_token(full_name) != ""
+        same_last = last_token(full_name) == last_token(external_name) and last_token(full_name) != ""
+        ext_subset_in_full = bool(ext_tokens) and ext_tokens.issubset(full_tokens)
+        full_subset_in_ext = bool(full_tokens) and full_tokens.issubset(ext_tokens)
+        starts_like = full_name.startswith(external_name) or external_name.startswith(full_name)
+        length_gap = abs(len(full_name) - len(external_name))
+        same_name_length = len(full_name) == len(external_name)
+
+        score_token_set = float(fuzz.token_set_ratio(full_name, external_name))
+        score_partial = float(fuzz.partial_ratio(full_name, external_name))
+        score_sort = float(fuzz.token_sort_ratio(full_name, external_name))
+        score_prefix = float(fuzz.ratio(full_name[:max_external_chars], external_name[:max_external_chars]))
+        score_ordered_chars = ordered_character_ratio(full_name, external_name)
+        score_aligned_chars = aligned_character_ratio(full_name, external_name)
+        cached = {
+            "full_tokens": full_tokens,
+            "ext_tokens": ext_tokens,
+            "same_first": same_first,
+            "same_last": same_last,
+            "ext_subset_in_full": ext_subset_in_full,
+            "full_subset_in_ext": full_subset_in_ext,
+            "starts_like": starts_like,
+            "length_gap": length_gap,
+            "same_name_length": same_name_length,
+            "score_token_set": score_token_set,
+            "score_partial": score_partial,
+            "score_sort": score_sort,
+            "score_prefix": score_prefix,
+            "score_ordered_chars": score_ordered_chars,
+            "score_aligned_chars": score_aligned_chars,
+        }
+        if metrics_cache is not None:
+            metrics_cache[cache_key] = cached
+    full_tokens = cached["full_tokens"]
+    ext_tokens = cached["ext_tokens"]
+    same_first = cached["same_first"]
+    same_last = cached["same_last"]
+    ext_subset_in_full = cached["ext_subset_in_full"]
+    full_subset_in_ext = cached["full_subset_in_ext"]
+    starts_like = cached["starts_like"]
+    length_gap = cached["length_gap"]
+    same_name_length = cached["same_name_length"]
+    score_token_set = cached["score_token_set"]
+    score_partial = cached["score_partial"]
+    score_sort = cached["score_sort"]
+    score_prefix = cached["score_prefix"]
+    score_ordered_chars = cached["score_ordered_chars"]
+    score_aligned_chars = cached["score_aligned_chars"]
     weights = resolve_score_weights(config)
-
-    same_first = first_token(full_name) == first_token(external_name) and first_token(full_name) != ""
-    same_last = last_token(full_name) == last_token(external_name) and last_token(full_name) != ""
-    ext_subset_in_full = bool(ext_tokens) and ext_tokens.issubset(full_tokens)
-    full_subset_in_ext = bool(full_tokens) and full_tokens.issubset(ext_tokens)
-    starts_like = full_name.startswith(external_name) or external_name.startswith(full_name)
-    length_gap = abs(len(full_name) - len(external_name))
-    same_name_length = len(full_name) == len(external_name)
-
-    score_token_set = float(fuzz.token_set_ratio(full_name, external_name))
-    score_partial = float(fuzz.partial_ratio(full_name, external_name))
-    score_sort = float(fuzz.token_sort_ratio(full_name, external_name))
-    score_prefix = float(fuzz.ratio(full_name[:max_external_chars], external_name[:max_external_chars]))
-    score_ordered_chars = ordered_character_ratio(full_name, external_name)
-    score_aligned_chars = aligned_character_ratio(full_name, external_name)
     m2_left = str(match2_left or "").strip().upper()
     m2_right = str(match2_right or "").strip().upper()
     prefix_chars = max(int(match2_prefix_chars or 1), 1)
     m2_prefix_left = m2_left[:prefix_chars]
     m2_prefix_right = m2_right[:prefix_chars]
-    match2_equal_prefix = bool(m2_prefix_left and m2_prefix_right and m2_prefix_left == m2_prefix_right)
-    if m2_left or m2_right:
+    match2_is_date = is_ddmmyyyy(m2_left) and is_ddmmyyyy(m2_right)
+    if match2_is_date:
+        match2_equal_prefix = bool(m2_left and m2_right and m2_left == m2_right)
+        match2_score = 100.0 if match2_equal_prefix else 0.0
+    elif m2_left or m2_right:
+        match2_equal_prefix = bool(m2_prefix_left and m2_prefix_right and m2_prefix_left == m2_prefix_right)
         match2_score = ordered_character_ratio(m2_prefix_left, m2_prefix_right)
     else:
+        match2_equal_prefix = False
         match2_score = 0.0
 
     score = (
@@ -329,6 +422,7 @@ def score_candidate(
 
     score = min(max(score, 0.0), 100.0)
     score_composite = min(max(score + (match2_score * float(match2_weight)), 0.0), 100.0)
+    has_match2_conflict = bool(match2_is_date and m2_left and m2_right and not match2_equal_prefix)
     structure_ok = same_first and (
         same_last
         or ext_subset_in_full
@@ -367,6 +461,7 @@ def score_candidate(
         "match2_prefix_right": m2_prefix_right,
         "match2_equal_prefix": match2_equal_prefix,
         "match2_score": round(match2_score, 2),
+        "has_match2_conflict": has_match2_conflict,
     }
 
 
@@ -383,19 +478,31 @@ def build_summary(df: pd.DataFrame, status_column: str = "final_status") -> pd.D
     return summary
 
 
-def _autosize_columns(ws, max_width: int = 56) -> None:
-    for col in ws.columns:
+def _autosize_columns(
+    ws,
+    max_width: int = 56,
+    sample_row_limit: int = 200,
+    max_column_limit: int = 60,
+) -> None:
+    max_row = min(ws.max_row, sample_row_limit)
+    max_col = min(ws.max_column, max_column_limit)
+    for col_index, col in enumerate(ws.iter_cols(min_row=1, max_row=max_row, min_col=1, max_col=max_col), start=1):
         if not col:
             continue
         letter = col[0].column_letter
         best = 0
-        for cell in col[:3000]:
+        for cell in col:
             try:
                 value = "" if cell.value is None else str(cell.value)
             except Exception:
                 value = ""
             best = max(best, len(value))
         ws.column_dimensions[letter].width = min(max(best + 2, 10), max_width)
+
+    for col_index in range(max_col + 1, ws.max_column + 1):
+        letter = ws.cell(row=1, column=col_index).column_letter
+        if ws.column_dimensions[letter].width is None:
+            ws.column_dimensions[letter].width = 18
 
 
 def _find_header_index(ws, header_name: str) -> int | None:
@@ -406,13 +513,162 @@ def _find_header_index(ws, header_name: str) -> int | None:
     return None
 
 
-def format_output_workbook(output_file: Path, result: AnalysisResult, results_startrow: int) -> None:
+def _style_header_row(ws, row_number: int, header_fill: PatternFill, header_font: Font) -> None:
+    for cell in ws[row_number]:
+        cell.fill = header_fill
+        cell.font = header_font
+
+
+def _fill_sheet_row(ws, row_number: int, fill: PatternFill) -> None:
+    for row in ws.iter_rows(min_row=row_number, max_row=row_number, min_col=1, max_col=ws.max_column):
+        for cell in row:
+            cell.fill = fill
+
+
+def _fill_sheet_cells(ws, row_number: int, column_numbers: list[int], fill: PatternFill) -> None:
+    for column_number in column_numbers:
+        if 1 <= column_number <= ws.max_column:
+            ws.cell(row=row_number, column=column_number).fill = fill
+
+
+def _copy_source_sheet_table(
+    wb,
+    output_sheet_name: str,
+    source_file: str | Path,
+    source_sheet_name: str,
+    header_row: int,
+    data_row_count: int,
+    column_count: int,
+    insert_at: int,
+):
+    if output_sheet_name in wb.sheetnames:
+        del wb[output_sheet_name]
+    ws = wb.create_sheet(output_sheet_name, insert_at)
+
+    source_wb = load_workbook(Path(source_file), data_only=False)
+    try:
+        source_ws = source_wb[source_sheet_name]
+        first_row = int(header_row)
+        last_row = first_row + int(data_row_count)
+        for source_row in source_ws.iter_rows(
+            min_row=first_row,
+            max_row=last_row,
+            min_col=1,
+            max_col=int(column_count),
+        ):
+            for source_cell in source_row:
+                target_cell = ws.cell(
+                    row=source_cell.row - first_row + 1,
+                    column=source_cell.column,
+                    value=source_cell.value,
+                )
+                target_cell.number_format = source_cell.number_format
+        for col_index in range(1, int(column_count) + 1):
+            letter = ws.cell(row=1, column=col_index).column_letter
+            source_width = source_ws.column_dimensions[letter].width
+            if source_width is not None:
+                ws.column_dimensions[letter].width = source_width
+        return ws
+    finally:
+        source_wb.close()
+
+
+def _format_results_sheet(
+    ws,
+    result: AnalysisResult,
+    results_startrow: int,
+    header_fill: PatternFill,
+    header_font: Font,
+    fill_summary: PatternFill,
+    fill_conflict: PatternFill,
+    fills: dict[str, PatternFill],
+) -> None:
+    summary_header_row = 1
+    data_header_row = results_startrow + 1
+    _style_header_row(ws, summary_header_row, header_fill, header_font)
+    for row in ws.iter_rows(min_row=2, max_row=results_startrow):
+        for cell in row:
+            if cell.value not in (None, ""):
+                cell.fill = fill_summary
+    _style_header_row(ws, data_header_row, header_fill, header_font)
+    ws.freeze_panes = f"A{data_header_row + 1}"
+    for excel_row, bucket in enumerate(result.results_df["final_color_bucket"].fillna("").tolist(), start=data_header_row + 1):
+        fill = fills.get(str(bucket), None)
+        if fill is not None:
+            _fill_sheet_row(ws, excel_row, fill)
+    conflict_col = _find_header_index(ws, "final_conflict_flags")
+    if conflict_col is not None:
+        for row in ws.iter_rows(min_row=data_header_row + 1, max_row=ws.max_row):
+            value = str(row[conflict_col - 1].value or "").strip()
+            if value:
+                row[conflict_col - 1].fill = fill_conflict
+
+
+def _format_original_sheet(
+    ws,
+    bucket_by_row_id: dict[int, str],
+    column_numbers: list[int],
+    fills: dict[str, PatternFill],
+    header_fill: PatternFill,
+    header_font: Font,
+) -> None:
+    _style_header_row(ws, 1, header_fill, header_font)
+    ws.freeze_panes = "A2"
+    for row_id, bucket in bucket_by_row_id.items():
+        if str(bucket) == "NO_MATCH":
+            continue
+        fill = fills.get(str(bucket), None)
+        if fill is None:
+            continue
+        excel_row = int(row_id) + 1
+        _fill_sheet_cells(ws, excel_row, column_numbers, fill)
+
+
+def _format_reconciliation_sheet(
+    ws,
+    reconciliation_df: pd.DataFrame,
+    money_cols_t1: list[str],
+    money_cols_t2: list[str],
+    fills: dict[str, PatternFill],
+    header_fill: PatternFill,
+    header_font: Font,
+) -> None:
+    _style_header_row(ws, 1, header_fill, header_font)
+    ws.freeze_panes = "A2"
+    bucket_left_idx = reconciliation_df.columns.get_loc("_bucket_left") if "_bucket_left" in reconciliation_df.columns else None
+    bucket_right_idx = reconciliation_df.columns.get_loc("_bucket_right") if "_bucket_right" in reconciliation_df.columns else None
+    for row_number, row in enumerate(reconciliation_df.itertuples(index=False, name=None), start=2):
+        if bucket_left_idx is not None and row[bucket_left_idx]:
+            ws.cell(row=row_number, column=1).fill = fills.get(str(row[bucket_left_idx]), PatternFill())
+        if bucket_right_idx is not None and row[bucket_right_idx]:
+            ws.cell(row=row_number, column=2).fill = fills.get(str(row[bucket_right_idx]), PatternFill())
+    money_headers = [f"E1:{column}" for column in money_cols_t1] + [f"E2:{column}" for column in money_cols_t2]
+    for header_name in money_headers:
+        header_index = _find_header_index(ws, header_name)
+        if header_index is None:
+            continue
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+            cell = row[header_index - 1]
+            if isinstance(cell.value, (int, float)) and not isinstance(cell.value, bool):
+                cell.number_format = 'R$ #,##0.00;[Red]-R$ #,##0.00'
+
+
+def _apply_sheet_autofit(ws) -> None:
+    if ws.max_column > 80:
+        return
+    sample_row_limit = 120 if ws.max_row > 5000 else 200
+    _autosize_columns(ws, sample_row_limit=sample_row_limit)
+
+
+def format_output_workbook(
+    output_file: Path,
+    result: AnalysisResult,
+    progress_callback: ProgressCallback | None = None,
+) -> None:
     wb = load_workbook(output_file)
 
     header_fill = PatternFill("solid", fgColor="1F4E78")
     header_font = Font(color="FFFFFF", bold=True)
-    fill_summary = PatternFill("solid", fgColor="D9EAF7")
-    fill_conflict = PatternFill("solid", fgColor="FCE5CD")
     fills = {
         "EXACT": PatternFill("solid", fgColor=normalize_fill_color(result.config.get("color_exact"), DEFAULT_MATCH_COLORS["color_exact"])),
         "MATCH": PatternFill("solid", fgColor=normalize_fill_color(result.config.get("color_match"), DEFAULT_MATCH_COLORS["color_match"])),
@@ -425,6 +681,16 @@ def format_output_workbook(output_file: Path, result: AnalysisResult, results_st
     target_row_map = result.target_df.set_index("excel_row_t2")["target_row_id"].to_dict() if not result.target_df.empty else {}
     money_cols_t1 = parse_csv_columns(result.config.get("tab4_money_cols_t1", ""))
     money_cols_t2 = parse_csv_columns(result.config.get("tab4_money_cols_t2", ""))
+    original_col_count_t1 = len(extract_original_columns(result.source_df, "source_row_id"))
+    original_col_count_t2 = len(extract_original_columns(result.target_df, "target_row_id"))
+    original_highlight_cols_t1 = [excel_col_to_index(result.config["name_col_t1"]) + 1]
+    original_highlight_cols_t2 = [excel_col_to_index(result.config["name_col_t2"]) + 1]
+    if result.config.get("match2_col_t1"):
+        original_highlight_cols_t1.append(excel_col_to_index(result.config["match2_col_t1"]) + 1)
+    if result.config.get("match2_col_t2"):
+        original_highlight_cols_t2.append(excel_col_to_index(result.config["match2_col_t2"]) + 1)
+    original_highlight_cols_t1 = sorted(set(original_highlight_cols_t1))
+    original_highlight_cols_t2 = sorted(set(original_highlight_cols_t2))
     target_bucket_by_row_id: dict[int, str] = {
         int(row_id): "NO_MATCH" for row_id in result.target_df["target_row_id"].tolist()
     } if not result.target_df.empty else {}
@@ -441,79 +707,53 @@ def format_output_workbook(output_file: Path, result: AnalysisResult, results_st
         if priority.get(bucket, 0) >= priority.get(current, 0):
             target_bucket_by_row_id[int(target_row_id)] = bucket
 
-    for ws in wb.worksheets:
-        if ws.title == "resultados_match":
-            summary_header_row = 1
-            data_header_row = results_startrow + 1
-            for cell in ws[summary_header_row]:
-                cell.fill = header_fill
-                cell.font = header_font
-            for row in ws.iter_rows(min_row=2, max_row=results_startrow):
-                for cell in row:
-                    if cell.value not in (None, ""):
-                        cell.fill = fill_summary
-            for cell in ws[data_header_row]:
-                cell.fill = header_fill
-                cell.font = header_font
-            ws.freeze_panes = f"A{data_header_row + 1}"
-            for excel_row, bucket in enumerate(result.results_df["final_color_bucket"].fillna("").tolist(), start=data_header_row + 1):
-                fill = fills.get(str(bucket), None)
-                if fill is not None:
-                    for cell in ws[excel_row]:
-                        cell.fill = fill
-            conflict_col = _find_header_index(ws, "final_conflict_flags")
-            if conflict_col is not None:
-                for row in ws.iter_rows(min_row=data_header_row + 1, max_row=ws.max_row):
-                    value = str(row[conflict_col - 1].value or "").strip()
-                    if value:
-                        row[conflict_col - 1].fill = fill_conflict
-        elif ws.title == "excel_1_original":
-            for cell in ws[1]:
-                cell.fill = header_fill
-                cell.font = header_font
-            ws.freeze_panes = "A2"
-            for source_row_id, bucket in source_bucket_by_row.items():
-                fill = fills.get(str(bucket), None)
-                if fill is None:
-                    continue
-                excel_row = int(source_row_id) + 1
-                for cell in ws[excel_row]:
-                    cell.fill = fill
-        elif ws.title == "excel_2_original":
-            for cell in ws[1]:
-                cell.fill = header_fill
-                cell.font = header_font
-            ws.freeze_panes = "A2"
-            for target_row_id, bucket in target_bucket_by_row_id.items():
-                fill = fills.get(str(bucket), None)
-                if fill is None:
-                    continue
-                excel_row = int(target_row_id) + 1
-                for cell in ws[excel_row]:
-                    cell.fill = fill
-        elif ws.title == "conciliacao_quantidades":
-            for cell in ws[1]:
-                cell.fill = header_fill
-                cell.font = header_font
-            ws.freeze_panes = "A2"
-            reconciliation_df = result.grouped_reconciliation_df
-            for row_number, row in enumerate(reconciliation_df.to_dict("records"), start=2):
-                if row.get("_bucket_left"):
-                    ws.cell(row=row_number, column=1).fill = fills.get(str(row["_bucket_left"]), PatternFill())
-                if row.get("_bucket_right"):
-                    ws.cell(row=row_number, column=2).fill = fills.get(str(row["_bucket_right"]), PatternFill())
-            money_headers = [f"E1:{column}" for column in money_cols_t1] + [f"E2:{column}" for column in money_cols_t2]
-            for header_name in money_headers:
-                header_index = _find_header_index(ws, header_name)
-                if header_index is None:
-                    continue
-                for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
-                    cell = row[header_index - 1]
-                    if isinstance(cell.value, (int, float)) and not isinstance(cell.value, bool):
-                        cell.number_format = 'R$ #,##0.00;[Red]-R$ #,##0.00'
-        ws.auto_filter.ref = ws.dimensions
-        _autosize_columns(ws)
+    emit_progress(progress_callback, "Copiando planilhas originais com valores preservados...", 88)
+    _copy_source_sheet_table(
+        wb,
+        "excel_1_original",
+        result.config["input_file_t1"],
+        result.config["sheet_t1"],
+        int(result.config["header_row_t1"]),
+        len(result.source_df),
+        original_col_count_t1,
+        0,
+    )
+    _copy_source_sheet_table(
+        wb,
+        "excel_2_original",
+        result.config["input_file_t2"],
+        result.config["sheet_t2"],
+        int(result.config["header_row_t2"]),
+        len(result.target_df),
+        original_col_count_t2,
+        1,
+    )
 
+    total_sheets = max(len(wb.worksheets), 1)
+    for index, ws in enumerate(wb.worksheets, start=1):
+        stage_percent = 88 + int((index - 1) / total_sheets * 8)
+        emit_progress(progress_callback, f"Formatando planilha {index}/{total_sheets}: {ws.title}...", stage_percent)
+        if ws.title == "excel_1_original":
+            _format_original_sheet(ws, source_bucket_by_row, original_highlight_cols_t1, fills, header_fill, header_font)
+        elif ws.title == "excel_2_original":
+            _format_original_sheet(ws, target_bucket_by_row_id, original_highlight_cols_t2, fills, header_fill, header_font)
+        elif ws.title == "conciliacao_quantidades":
+            _format_reconciliation_sheet(
+                ws,
+                result.grouped_reconciliation_df,
+                money_cols_t1,
+                money_cols_t2,
+                fills,
+                header_fill,
+                header_font,
+            )
+        ws.auto_filter.ref = ws.dimensions
+        if ws.title in {"excel_1_original", "excel_2_original"}:
+            continue
+        emit_progress(progress_callback, f"Ajustando larguras: {ws.title}...", min(stage_percent + 1, 97))
+        _apply_sheet_autofit(ws)
+
+    emit_progress(progress_callback, "Salvando arquivo formatado...", 98)
     wb.save(output_file)
 
 
@@ -986,8 +1226,21 @@ def prepare_input_frames(config: dict[str, Any], progress_callback: ProgressCall
     limit_chars = int(config["max_external_chars"])
     df1["nome_t1_match_norm"] = df1["nome_t1_norm"].str[:limit_chars]
     df2["nome_t2_match_norm"] = df2["nome_t2_norm"].str[:limit_chars]
-    df1["match2_t1_norm"] = df1["match2_t1_original"].fillna("").astype(str).str.strip().str.upper()
-    df2["match2_t2_norm"] = df2["match2_t2_original"].fillna("").astype(str).str.strip().str.upper()
+    match2_norm_cache: dict[str, str] = {}
+
+    def normalize_match2_value(value: Any) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        cached = match2_norm_cache.get(text)
+        if cached is not None:
+            return cached
+        normalized = normalize_date_ddmmyyyy(text)
+        match2_norm_cache[text] = normalized
+        return normalized
+
+    df1["match2_t1_norm"] = df1["match2_t1_original"].map(normalize_match2_value)
+    df2["match2_t2_norm"] = df2["match2_t2_original"].map(normalize_match2_value)
     prefix_chars = int(config.get("match2_prefix_chars", 8))
     df1["match2_t1_prefix"] = df1["match2_t1_norm"].str[:prefix_chars]
     df2["match2_t2_prefix"] = df2["match2_t2_norm"].str[:prefix_chars]
@@ -1005,6 +1258,10 @@ def build_target_catalog(df2: pd.DataFrame, config: dict[str, Any]) -> tuple[pd.
     df2_valid = df2[df2["nome_t2_match_norm"] != ""].copy()
     if df2_valid.empty:
         return pd.DataFrame(), {"by_prefix": defaultdict(list), "by_first": defaultdict(list), "by_last": defaultdict(list), "all": []}
+
+    variants_by_key: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for variant in df2_valid.sort_values("excel_row_t2").to_dict("records"):
+        variants_by_key[str(variant["nome_t2_match_norm"])].append(variant)
 
     grouped = (
         df2_valid.sort_values("excel_row_t2")
@@ -1030,6 +1287,8 @@ def build_target_catalog(df2: pd.DataFrame, config: dict[str, Any]) -> tuple[pd.
 
     grouped["quota_limit"] = grouped["quota_limit"].astype(int)
     grouped["quota_original"] = grouped["quota_original"].astype(int)
+    grouped["token_set"] = grouped["nome_t2_norm"].apply(token_set)
+    grouped["variants"] = grouped["nome_t2_norm"].map(lambda key: variants_by_key.get(str(key), []))
 
     indexes: dict[str, Any] = {
         "by_prefix": defaultdict(list),
@@ -1074,6 +1333,125 @@ def choose_candidate_pool(
     if not seen:
         absorb(target_indexes["all"])
     return list(seen.values())
+
+
+def fast_candidate_gate(
+    source_name: str,
+    source_tokens: set[str],
+    source_first: str,
+    source_last: str,
+    source_key_prefix: str,
+    source_match2_norm: str,
+    record: dict[str, Any],
+) -> bool:
+    target_name = str(record.get("nome_t2_norm", "") or "")
+    target_tokens = record.get("token_set")
+    if not isinstance(target_tokens, set):
+        target_tokens = token_set(target_name)
+    target_first = str(record.get("first_token", "") or "")
+    target_last = str(record.get("last_token", "") or "")
+    target_key_prefix = str(record.get("key_prefix", "") or "")
+    selected_variant = select_best_target_variant(source_match2_norm, record)
+    target_match2_norm = str(selected_variant.get("match2_t2_norm", record.get("match2_t2_norm", "")) or "")
+
+    if source_name == target_name:
+        return True
+    if source_key_prefix and source_key_prefix == target_key_prefix:
+        return True
+    if source_first and source_first == target_first:
+        return True
+    if source_last and source_last == target_last:
+        return True
+
+    overlap_count = len(source_tokens & target_tokens)
+    if overlap_count > 0:
+        if is_ddmmyyyy(source_match2_norm) and is_ddmmyyyy(target_match2_norm) and source_match2_norm != target_match2_norm:
+            return False
+        return True
+    return False
+
+
+def select_best_target_variant(
+    source_match2_norm: str,
+    record: dict[str, Any],
+    cache: dict[tuple[str, str], dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    target_key = str(record.get("nome_t2_norm", "") or "")
+    cache_key = (source_match2_norm, target_key)
+    if cache is not None and cache_key in cache:
+        return cache[cache_key]
+
+    variants = record.get("variants")
+    if not variants:
+        selected = record
+    else:
+        source_dt = parse_date_prefer_ddmmyyyy(source_match2_norm)
+        prefix_chars = max(len(str(source_match2_norm or "").strip()), 1)
+
+        def variant_key(variant: dict[str, Any]) -> tuple[Any, ...]:
+            variant_match2_norm = str(variant.get("match2_t2_norm", "") or "")
+            variant_dt = parse_date_prefer_ddmmyyyy(variant_match2_norm)
+            exact_date = bool(source_dt is not None and variant_dt is not None and source_dt.date() == variant_dt.date())
+            exact_norm = bool(source_match2_norm and variant_match2_norm and source_match2_norm == variant_match2_norm)
+            same_prefix = bool(
+                source_match2_norm
+                and variant_match2_norm
+                and source_match2_norm[:prefix_chars] == variant_match2_norm[:prefix_chars]
+            )
+            date_delta = abs((source_dt - variant_dt).total_seconds()) if source_dt is not None and variant_dt is not None else float("inf")
+            return (
+                0 if exact_date else 1,
+                0 if exact_norm else 1,
+                0 if same_prefix else 1,
+                date_delta,
+                int(variant.get("target_row_id", 10**9) or 10**9),
+                int(variant.get("excel_row_t2", 10**9) or 10**9),
+            )
+
+        selected = min(variants, key=variant_key)
+
+    if cache is not None:
+        cache[cache_key] = selected
+    return selected
+
+
+def fast_candidate_score(
+    source_name: str,
+    source_tokens: set[str],
+    source_first: str,
+    source_last: str,
+    source_key_prefix: str,
+    source_match2_norm: str,
+    record: dict[str, Any],
+) -> float:
+    target_name = str(record.get("nome_t2_norm", "") or "")
+    target_tokens = record.get("token_set")
+    if not isinstance(target_tokens, set):
+        target_tokens = token_set(target_name)
+    target_first = str(record.get("first_token", "") or "")
+    target_last = str(record.get("last_token", "") or "")
+    target_key_prefix = str(record.get("key_prefix", "") or "")
+    selected_variant = select_best_target_variant(source_match2_norm, record)
+    target_match2_norm = str(selected_variant.get("match2_t2_norm", record.get("match2_t2_norm", "")) or "")
+
+    score = 0.0
+    if source_name == target_name:
+        score += 200.0
+    if source_key_prefix and source_key_prefix == target_key_prefix:
+        score += 80.0
+    if source_first and source_first == target_first:
+        score += 40.0
+    if source_last and source_last == target_last:
+        score += 20.0
+    score += len(source_tokens & target_tokens) * 12.0
+    score -= abs(len(source_name) - len(target_name)) * 0.3
+
+    if is_ddmmyyyy(source_match2_norm) and is_ddmmyyyy(target_match2_norm):
+        if source_match2_norm == target_match2_norm:
+            score += 24.0
+        else:
+            score -= 24.0
+    return score
 
 
 def candidate_utility(candidate: dict[str, Any]) -> int:
@@ -1279,6 +1657,9 @@ def analyze_matching(config: dict[str, Any], progress_callback: ProgressCallback
     emit_progress(progress_callback, "Calculando pontuação dos grupos de candidatos...", 18)
     rows = list(results_df.index)
     internal_keep = max(config["top_candidates_to_keep"], 8)
+    preselect_keep = max(internal_keep * 4, 24)
+    pair_metrics_cache: dict[tuple[str, str], dict[str, Any]] = {}
+    variant_selection_cache: dict[tuple[str, str], dict[str, Any]] = {}
 
     for position, row_index in enumerate(rows, start=1):
         if position % 50 == 0 or position == len(rows):
@@ -1301,17 +1682,57 @@ def analyze_matching(config: dict[str, Any], progress_callback: ProgressCallback
             str(row["last_token"]),
             target_indexes,
         )
+        source_tokens = token_set(name_norm)
+        source_first = str(row["first_token"] or "")
+        source_last = str(row["last_token"] or "")
+        source_key_prefix = str(row["key_prefix"] or "")
+        source_match2_norm = str(row.get("match2_t1_norm", "") or "")
+
+        gated_pool = [
+            record
+            for record in pool
+            if fast_candidate_gate(
+                name_norm,
+                source_tokens,
+                source_first,
+                source_last,
+                source_key_prefix,
+                source_match2_norm,
+                record,
+            )
+        ]
+        if not gated_pool:
+            gated_pool = pool
+
+        if len(gated_pool) > preselect_keep:
+            quick_ranked = sorted(
+                gated_pool,
+                key=lambda record: fast_candidate_score(
+                    name_norm,
+                    source_tokens,
+                    source_first,
+                    source_last,
+                    source_key_prefix,
+                    source_match2_norm,
+                    record,
+                ),
+                reverse=True,
+            )
+            gated_pool = quick_ranked[:preselect_keep]
+
         scored: list[dict[str, Any]] = []
-        for record in pool:
+        for record in gated_pool:
+            selected_variant = select_best_target_variant(source_match2_norm, record, variant_selection_cache)
             metrics = score_candidate(
                 name_norm,
                 str(record["nome_t2_norm"]),
                 config["max_external_chars"],
                 match2_left=str(row.get("match2_t1_norm", "") or ""),
-                match2_right=str(record.get("match2_t2_norm", "") or ""),
+                match2_right=str(selected_variant.get("match2_t2_norm", record.get("match2_t2_norm", "")) or ""),
                 match2_prefix_chars=int(config.get("match2_prefix_chars", 8)),
                 match2_weight=float(config.get("match2_weight", 0.2)),
                 config=config,
+                metrics_cache=pair_metrics_cache,
             )
             exact_norm = name_norm == record["nome_t2_norm"]
             exact_prefix = bool(row["key_prefix"]) and str(row["key_prefix"]) == str(record["key_prefix"])
@@ -1324,12 +1745,13 @@ def analyze_matching(config: dict[str, Any], progress_callback: ProgressCallback
                     "nome_t1_norm_full": row["nome_t1_norm"],
                     "match2_t1_original": row.get("match2_t1_original", ""),
                     "match2_t1_norm": row.get("match2_t1_norm", ""),
-                    "nome_t2_original": record["nome_t2_original"],
+                    "nome_t2_original": selected_variant.get("nome_t2_original", record["nome_t2_original"]),
                     "nome_t2_norm": record["nome_t2_norm"],
                     "nome_t2_norm_full": record.get("nome_t2_norm_full", record["nome_t2_norm"]),
-                    "match2_t2_original": record.get("match2_t2_original", ""),
-                    "match2_t2_norm": record.get("match2_t2_norm", ""),
-                    "excel_row_t2": record["excel_row_t2"],
+                    "match2_t2_original": selected_variant.get("match2_t2_original", record.get("match2_t2_original", "")),
+                    "match2_t2_norm": selected_variant.get("match2_t2_norm", record.get("match2_t2_norm", "")),
+                    "excel_row_t2": selected_variant.get("excel_row_t2", record["excel_row_t2"]),
+                    "target_row_id": selected_variant.get("target_row_id", pd.NA),
                     "quota_original": record["quota_original"],
                     "quota_limit": record["quota_limit"],
                     "exact_norm": exact_norm,
@@ -1360,19 +1782,28 @@ def analyze_matching(config: dict[str, Any], progress_callback: ProgressCallback
             candidate["gap_to_next"] = gap_to_next
             candidate["review_eligible"] = bool(candidate["score_composite"] >= config["review_score"] and candidate["same_first"])
             candidate["eligible_for_global"] = bool(
-                candidate["exact_norm"]
-                or candidate["exact_prefix"]
-                or (candidate["score_composite"] >= config["accept_score"] and candidate["structure_ok"])
+                (
+                    (candidate["exact_norm"] or candidate["exact_prefix"])
+                    and not candidate.get("has_match2_conflict", False)
+                )
+                or (
+                    candidate["score_composite"] >= config["accept_score"]
+                    and candidate["structure_ok"]
+                    and not candidate.get("has_match2_conflict", False)
+                )
             )
             candidate["confident_if_top"] = bool(
                 rank == 1
                 and (
-                    candidate["exact_norm"]
-                    or candidate["exact_prefix"]
+                    (
+                        (candidate["exact_norm"] or candidate["exact_prefix"])
+                        and not candidate.get("has_match2_conflict", False)
+                    )
                     or (
                         candidate["score_composite"] >= config["accept_score"]
                         and candidate["structure_ok"]
                         and gap_to_next >= config["min_gap_for_accept"]
+                        and not candidate.get("has_match2_conflict", False)
                     )
                 )
                 and not candidate["needs_length_review"]
@@ -1447,11 +1878,31 @@ def analyze_matching(config: dict[str, Any], progress_callback: ProgressCallback
                 results_df.at[row_index, "analysis_match2_equal_prefix"] = bool(chosen.get("match2_equal_prefix", False))
                 results_df.at[row_index, "analysis_match2_score"] = chosen.get("match2_score", pd.NA)
 
+                m2_left_norm = str(results_df.at[row_index, "match2_t1_norm"] or "")
+                m2_right_norm = str(chosen.get("match2_t2_norm", "") or "")
+                auto_accept = bool(
+                    int(chosen.get("rank", 1) or 1) == 1
+                    and (chosen["exact_norm"] or chosen["exact_prefix"])
+                    and bool(chosen.get("structure_ok", False))
+                    and not bool(chosen.get("needs_length_review", False))
+                    and bool(chosen.get("match2_equal_prefix", False))
+                    and is_ddmmyyyy(m2_left_norm)
+                    and is_ddmmyyyy(m2_right_norm)
+                    and m2_left_norm == m2_right_norm
+                    and not bool(chosen.get("has_match2_conflict", False))
+                    and not (bool(eligible_counts.get(source_row_id)) and assigned is None)
+                    and not (assigned is not None and int(assigned.get("rank", 1) or 1) > 1)
+                )
+
                 if assigned is not None and int(assigned["rank"]) == 1 and bool(assigned["confident_if_top"]):
                     results_df.at[row_index, "analysis_status"] = "ACEITO"
                     results_df.at[row_index, "analysis_method"] = (
                         "EXATO_GLOBAL" if assigned["exact_norm"] or assigned["exact_prefix"] else "FUZZY_GLOBAL"
                     )
+                    results_df.at[row_index, "analysis_review_reason"] = ""
+                elif auto_accept:
+                    results_df.at[row_index, "analysis_status"] = "ACEITO"
+                    results_df.at[row_index, "analysis_method"] = "AUTO_EXATO_DATA_GLOBAL" if assigned is not None else "AUTO_EXATO_DATA"
                     results_df.at[row_index, "analysis_review_reason"] = ""
                 elif assigned is not None:
                     results_df.at[row_index, "analysis_status"] = "REVISAR"
@@ -1801,28 +2252,18 @@ def export_analysis_result(
     result.review_df = result.results_df[result.results_df["final_status"] == "REVISAR"].copy()
     result.preview_df = result.results_df.head(40).copy()
     result.quota_df = build_quota_summary(result.results_df, result.catalog_df)
+    log_revisar_audit(result, progress_callback)
 
-    source_original_columns = extract_original_columns(result.source_df, "source_row_id")
-    target_original_columns = extract_original_columns(result.target_df, "target_row_id")
-    export_source_df = result.source_df[source_original_columns].copy()
-    export_target_df = result.target_df[target_original_columns].copy()
-    results_export_df = build_results_export_df(result)
-    summary_rows_df = build_export_summary_rows(result)
     reconciliation_df = build_grouped_reconciliation_df(result)
     result.grouped_reconciliation_df = reconciliation_df.copy()
-    results_startrow = len(summary_rows_df) + 2
 
     emit_progress(progress_callback, "Escrevendo arquivo Excel...", 55)
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        export_source_df.to_excel(writer, sheet_name="excel_1_original", index=False)
-        export_target_df.to_excel(writer, sheet_name="excel_2_original", index=False)
-        summary_rows_df.to_excel(writer, sheet_name="resultados_match", index=False)
-        results_export_df.to_excel(writer, sheet_name="resultados_match", index=False, startrow=results_startrow)
         visible_cols = [column for column in reconciliation_df.columns if not column.startswith("_")]
         reconciliation_df[visible_cols].to_excel(writer, sheet_name="conciliacao_quantidades", index=False)
 
     emit_progress(progress_callback, "Formatando arquivo...", 88)
-    format_output_workbook(output_path, result, results_startrow)
+    format_output_workbook(output_path, result, progress_callback=progress_callback)
     emit_progress(progress_callback, f"Exportação concluída: {output_path}", 100)
     return output_path
 
@@ -1838,6 +2279,63 @@ def build_export_catalog(result: AnalysisResult) -> pd.DataFrame:
         columns = ["nome_t2_norm", "nome_t2_original", "quota_original", "quota_limit", "excel_row_t2"]
         return pd.DataFrame(columns=columns)
     return result.catalog_df.copy()
+
+
+def log_revisar_audit(result: AnalysisResult, progress_callback: ProgressCallback | None) -> None:
+    if not progress_callback:
+        return
+    df = result.results_df
+    if df.empty or "final_status" not in df.columns:
+        return
+    rev = df[df["final_status"] == "REVISAR"].copy()
+    total = int(len(rev))
+    if total == 0:
+        emit_progress(progress_callback, "AUDIT REVISAR: 0 linhas em revisão.", None)
+        return
+
+    group_key = rev.get("final_group_t2_norm", pd.Series([""] * total)).fillna("").astype(str)
+    group_sizes = group_key.value_counts().head(20)
+
+    target = result.target_df
+    if target is not None and not target.empty and "nome_t2_match_norm" in target.columns and "match2_t2_norm" in target.columns:
+        target_pairs = set(
+            zip(
+                target["nome_t2_match_norm"].fillna("").astype(str).tolist(),
+                target["match2_t2_norm"].fillna("").astype(str).tolist(),
+                strict=False,
+            )
+        )
+    else:
+        target_pairs = set()
+
+    left_dates = rev.get("match2_t1_norm", pd.Series([""] * total)).fillna("").astype(str)
+    has_exact_target_date = [
+        bool(g and d and (g, d) in target_pairs) for g, d in zip(group_key.tolist(), left_dates.tolist(), strict=False)
+    ]
+    exact_target_count = int(sum(has_exact_target_date))
+
+    flags = rev.get("final_conflict_flags", pd.Series([""] * total)).fillna("").astype(str)
+    top_flags = flags.value_counts().head(8).to_dict()
+
+    emit_progress(progress_callback, f"AUDIT REVISAR: total={total} | com_alvo_data_exata={exact_target_count}", None)
+    emit_progress(progress_callback, f"AUDIT REVISAR: top_grupos={group_sizes.to_dict()}", None)
+    emit_progress(progress_callback, f"AUDIT REVISAR: top_flags={top_flags}", None)
+
+    rev = rev.assign(_group_key=group_key, _left_date=left_dates, _has_exact_date=has_exact_target_date)
+    examples = rev[rev["_has_exact_date"]].head(8)
+    if not examples.empty:
+        for _idx, row in examples.iterrows():
+            msg = (
+                f"AUDIT REVISAR EX: linha={row.get('excel_row_t1','')} "
+                f"nome={row.get('nome_t1_original','')} "
+                f"grupo={row.get('_group_key','')} "
+                f"data={row.get('_left_date','')} "
+                f"cand={row.get('final_match_t2_original','')} "
+                f"cand_data={row.get('final_match2_t2','')} "
+                f"score={row.get('final_score_composite','')} "
+                f"flags={row.get('final_conflict_flags','')}"
+            )
+            emit_progress(progress_callback, msg, None)
 
 
 def natural_sort_key(value: str) -> list[Any]:
@@ -1888,14 +2386,6 @@ def build_ordered_export_df(df: pd.DataFrame) -> pd.DataFrame:
     )
     ordered_df = df.loc[:, ordered_columns].copy()
 
-    date_column = pick_primary_date_column(ordered_df, remaining_source)
-    if date_column:
-        date_values = pd.to_datetime(ordered_df[date_column], errors="coerce", dayfirst=True, format="mixed")
-        ordered_df = (
-            ordered_df.assign(_sort_date=date_values)
-            .sort_values("_sort_date", ascending=False, kind="stable", na_position="last")
-            .drop(columns="_sort_date")
-        )
     return ordered_df.reset_index(drop=True)
 
 
@@ -1960,13 +2450,20 @@ def build_export_summary_rows(result: AnalysisResult) -> pd.DataFrame:
 
 
 def _parse_optional_datetime(value: Any) -> pd.Timestamp | None:
-    text = str(value or "").strip()
+    return parse_date_prefer_ddmmyyyy(value)
+
+
+def format_reconciliation_extra_value(raw_value: Any, *, is_money: bool) -> Any:
+    if is_money:
+        numeric_value = parse_brl_currency_value(raw_value)
+        return numeric_value if numeric_value is not None else str(raw_value or "")
+    text = str(raw_value or "").strip()
     if not text:
-        return None
-    parsed = pd.to_datetime(text, errors="coerce", dayfirst=True, format="mixed")
-    if pd.isna(parsed):
-        return None
-    return parsed
+        return ""
+    parsed = parse_date_prefer_ddmmyyyy(text)
+    if parsed is None:
+        return text
+    return parsed.strftime("%d/%m/%Y")
 
 
 def _pair_group_rows_by_match2(
@@ -1988,8 +2485,27 @@ def _pair_group_rows_by_match2(
     def normalize_prefix(value: Any) -> str:
         return str(value or "").strip().upper()[:prefix_chars]
 
-    # 1) Exact/Prefix-equal first when match2 exists on both sides.
+    # 1) Exact date equality first when parseable on both sides.
     for left_idx, left in enumerate(left_rows):
+        left_dt = _parse_optional_datetime(left.get("final_match2_t1", ""))
+        if left_dt is None:
+            continue
+        exact_date_candidates = []
+        for right_idx in remaining_right:
+            right_dt = _parse_optional_datetime(right_rows[right_idx].get("match2_t2_original", ""))
+            if right_dt is None:
+                continue
+            if left_dt.date() == right_dt.date():
+                exact_date_candidates.append(right_idx)
+        if exact_date_candidates:
+            chosen = min(exact_date_candidates, key=lambda idx: int(right_rows[idx].get("target_row_id", 0)))
+            assigned_right_by_left[left_idx] = chosen
+            remaining_right.remove(chosen)
+
+    # 2) Exact/Prefix-equal when match2 exists on both sides.
+    for left_idx, left in enumerate(left_rows):
+        if left_idx in assigned_right_by_left:
+            continue
         left_prefix = normalize_prefix(left.get("final_match2_t1", ""))
         if not left_prefix:
             continue
@@ -2003,7 +2519,7 @@ def _pair_group_rows_by_match2(
             assigned_right_by_left[left_idx] = chosen
             remaining_right.remove(chosen)
 
-    # 2) If no exact match, align by date proximity when parseable.
+    # 3) If no exact match, align by date proximity when parseable.
     for left_idx, left in enumerate(left_rows):
         if left_idx in assigned_right_by_left:
             continue
@@ -2022,9 +2538,11 @@ def _pair_group_rows_by_match2(
             assigned_right_by_left[left_idx] = chosen
             remaining_right.remove(chosen)
 
-    # 3) Fallback: keep deterministic order for leftovers.
-    for left_idx, _left in enumerate(left_rows):
+    # 4) Fallback: deterministic pairing only for rows that still have a selected match.
+    for left_idx, left in enumerate(left_rows):
         if left_idx in assigned_right_by_left:
+            continue
+        if not str(left.get("final_match_t2_norm", "") or "").strip():
             continue
         if not remaining_right:
             break
@@ -2050,7 +2568,8 @@ def build_grouped_reconciliation_df(result: AnalysisResult) -> pd.DataFrame:
     target_records = target_df.to_dict("records")
     targets_by_norm: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for record in target_records:
-        targets_by_norm[str(record.get("nome_t2_norm") or "")].append(record)
+        group_key = str(record.get("nome_t2_match_norm") or record.get("nome_t2_norm") or "")
+        targets_by_norm[group_key].append(record)
 
     for norm in targets_by_norm:
         targets_by_norm[norm].sort(key=lambda item: int(item.get("target_row_id", 0)))
@@ -2083,31 +2602,77 @@ def build_grouped_reconciliation_df(result: AnalysisResult) -> pd.DataFrame:
         group_key = str(record.get("final_group_t2_norm") or record.get("nome_t1_norm") or "")
         groups[group_key].append(record)
 
-    all_group_keys = sorted(set(groups.keys()) | set(targets_by_norm.keys()))
-    rows: list[dict[str, Any]] = []
+    group_order_rows: list[tuple[int, int, str]] = []
+    all_group_keys = set(groups.keys()) | set(targets_by_norm.keys())
     for group_key in all_group_keys:
+        left_group_rows = groups.get(group_key, [])
+        right_group_rows = targets_by_norm.get(group_key, [])
+        first_source_row = min((int(row.get("source_row_id", 10**9)) for row in left_group_rows), default=10**9)
+        first_target_row = min((int(row.get("target_row_id", 10**9)) for row in right_group_rows), default=10**9)
+        group_order_rows.append((first_source_row, first_target_row, group_key))
+    ordered_group_keys = [
+        group_key
+        for _source_row, _target_row, group_key in sorted(
+            group_order_rows,
+            key=lambda item: (
+                0 if item[0] != 10**9 else 1,
+                item[0],
+                item[1],
+                natural_sort_key(item[2]),
+            ),
+        )
+    ]
+    rows: list[dict[str, Any]] = []
+    for group_key in ordered_group_keys:
         left_rows = groups.get(group_key, [])
         left_rows.sort(
             key=lambda item: (
-                {"EXACT": 0, "MATCH": 1, "REVIEW": 2, "EXCESS_LEFT": 3, "NO_MATCH": 4}.get(
-                    str(item.get("final_color_bucket") or "NO_MATCH"), 9
-                ),
-                0 if bool(item.get("final_match2_equal_prefix", False)) else 1,
-                -(safe_float(item.get("final_match2_score")) or 0.0),
+                0 if str(item.get("nome_t1_norm", "") or "")[: int(result.config.get("max_external_chars", 30))] == group_key else 1,
+                0 if str(item.get("final_match_t2_norm", "") or "") == group_key else 1,
+                {"ACEITO": 0, "REVISAR": 1, "SEM_MATCH": 2}.get(str(item.get("final_status", "") or ""), 9),
                 int(item.get("source_row_id", 0)),
             )
         )
         right_rows = targets_by_norm.get(group_key, [])
-        pairs = _pair_group_rows_by_match2(
-            left_rows,
-            right_rows,
-            int(result.config.get("match2_prefix_chars", 8)),
-        )
+        same_name_left_rows = [
+            item
+            for item in left_rows
+            if str(item.get("nome_t1_norm", "") or "")[: int(result.config.get("max_external_chars", 30))] == group_key
+        ]
+        other_left_rows = [item for item in left_rows if item not in same_name_left_rows]
+
+        if same_name_left_rows:
+            primary_pairs = _pair_group_rows_by_match2(
+                same_name_left_rows,
+                right_rows,
+                int(result.config.get("match2_prefix_chars", 8)),
+            )
+            remaining_right_rows = [right for left, right in primary_pairs if left is None and right is not None]
+            pairs = [pair for pair in primary_pairs if pair[0] is not None]
+            if other_left_rows:
+                pairs.extend(
+                    _pair_group_rows_by_match2(
+                        other_left_rows,
+                        remaining_right_rows,
+                        int(result.config.get("match2_prefix_chars", 8)),
+                    )
+                )
+            else:
+                pairs.extend((None, right) for right in remaining_right_rows)
+        else:
+            pairs = _pair_group_rows_by_match2(
+                left_rows,
+                right_rows,
+                int(result.config.get("match2_prefix_chars", 8)),
+            )
         if not pairs:
             pairs = [(None, None)]
         for left, right in pairs:
             left_bucket = str(left.get("final_color_bucket") or "NO_MATCH") if left else ""
-            right_bucket = left_bucket if right and left else ("NO_MATCH" if right else "")
+            if right and left:
+                right_bucket = left_bucket if left_bucket != "NO_MATCH" else ""
+            else:
+                right_bucket = "NO_MATCH" if right else ""
             rows.append(
                 {
                     "Excel 1": str(left.get("nome_t1_original") or "") if left else "",
@@ -2121,26 +2686,23 @@ def build_grouped_reconciliation_df(result: AnalysisResult) -> pd.DataFrame:
                 source_info = source_records_by_id.get(int(left.get("source_row_id", 0)), {})
                 for column in extra_cols_t1:
                     raw_value = source_info.get(column, "")
-                    if column in money_cols_t1:
-                        numeric_value = parse_brl_currency_value(raw_value)
-                        rows[-1][f"E1:{column}"] = numeric_value if numeric_value is not None else str(raw_value or "")
-                    else:
-                        rows[-1][f"E1:{column}"] = str(raw_value or "")
+                    rows[-1][f"E1:{column}"] = format_reconciliation_extra_value(
+                        raw_value,
+                        is_money=column in money_cols_t1,
+                    )
             else:
                 for column in extra_cols_t1:
                     rows[-1][f"E1:{column}"] = ""
             if right:
                 for column in extra_cols_t2:
                     raw_value = right.get(column, "")
-                    if column in money_cols_t2:
-                        numeric_value = parse_brl_currency_value(raw_value)
-                        rows[-1][f"E2:{column}"] = numeric_value if numeric_value is not None else str(raw_value or "")
-                    else:
-                        rows[-1][f"E2:{column}"] = str(raw_value or "")
+                    rows[-1][f"E2:{column}"] = format_reconciliation_extra_value(
+                        raw_value,
+                        is_money=column in money_cols_t2,
+                    )
             else:
                 for column in extra_cols_t2:
                     rows[-1][f"E2:{column}"] = ""
-        rows.append({"Excel 1": "", "Excel 2": "", "_bucket_left": "", "_bucket_right": "", "_group_key": ""})
     return pd.DataFrame(rows)
 
 
